@@ -100,6 +100,33 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+client.on('messageCreate', async (message) => {
+    if (!message.content.startsWith('!skip') || message.author.bot) return;
+
+    const voiceChannel = message.member.voice.channel;
+
+    if (!voiceChannel) {
+        return message.reply('¡Debes estar en un canal de voz para usar este comando!');
+    }
+
+    const serverQueue = queue.get(message.guild.id);
+
+    if (!serverQueue) {
+        return message.reply('No hay canciones en la cola para saltar.');
+    }
+
+    // Verificamos si hay más canciones en la cola
+    if (serverQueue.songs.length > 1) {
+        serverQueue.player.stop(); // Esto activará el evento `AudioPlayerStatus.Idle` y saltará a la siguiente canción
+        message.reply('⏭️ Canción saltada. Reproduciendo la siguiente en la cola.');
+    } else {
+        serverQueue.player.stop();
+        serverQueue.connection.destroy(); // Desconecta el bot si no hay más canciones
+        queue.delete(message.guild.id);
+        message.reply('⏭️ Canción saltada. No hay más canciones en la cola.');
+    }
+});
+
 function playSong(guild, song) {
     const serverQueue = queue.get(guild.id);
 
@@ -124,14 +151,22 @@ function playSong(guild, song) {
 
     serverQueue.player.on(AudioPlayerStatus.Idle, () => {
         serverQueue.songs.shift();
-        playSong(guild, serverQueue.songs[0]);
+        setTimeout(() => {
+            playSong(guild, serverQueue.songs[0]);
+        }, 3000); 
     });
 
     serverQueue.player.on('error', (error) => {
         console.error('Error en el reproductor:', error);
-        serverQueue.songs.shift();
-        playSong(guild, serverQueue.songs[0]);
+        if (serverQueue.songs.length > 1) {
+            serverQueue.songs.shift();
+            playSong(guild, serverQueue.songs[0]);
+        } else {
+            serverQueue.connection.destroy(); 
+            queue.delete(guild.id);
+        }
     });
+    
 }
 
 client.on('messageCreate', async (message) => {
