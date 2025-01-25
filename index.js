@@ -130,15 +130,8 @@ client.on('messageCreate', async (message) => {
 function playSong(guild, song) {
     const serverQueue = queue.get(guild.id);
 
-    if (!serverQueue) {
-        console.error('La cola no está configurada.');
-        return;
-    }
-
     if (!song) {
-        if (serverQueue.connection) {
-            serverQueue.connection.destroy();
-        }
+        serverQueue.connection.destroy();
         queue.delete(guild.id);
         return;
     }
@@ -160,7 +153,7 @@ function playSong(guild, song) {
         serverQueue.songs.shift();
         setTimeout(() => {
             playSong(guild, serverQueue.songs[0]);
-        }, 3000);
+        }, 3000); 
     });
 
     serverQueue.player.on('error', (error) => {
@@ -169,14 +162,12 @@ function playSong(guild, song) {
             serverQueue.songs.shift();
             playSong(guild, serverQueue.songs[0]);
         } else {
-            if (serverQueue.connection) {
-                serverQueue.connection.destroy();
-            }
+            serverQueue.connection.destroy(); 
             queue.delete(guild.id);
         }
     });
+    
 }
-
 
 client.on('messageCreate', async (message) => {
     if (!message.content.startsWith('!stop') || message.author.bot) return;
