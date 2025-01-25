@@ -11,7 +11,6 @@ Un bot de música para Discord que permite reproducir canciones desde YouTube me
 - Reproduce música desde enlaces de YouTube o nombres de canciones.
 - Administra una cola de canciones para reproducción continua.
 - Comandos para controlar la música (`!play`, `!skip`, `!stop`).
-- Configuración fácil mediante variables de entorno.
 
 ---
 
