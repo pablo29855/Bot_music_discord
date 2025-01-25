@@ -4,7 +4,6 @@ const ytdl = require('@distube/ytdl-core');
 const ytSearch = require('yt-search'); // Importamos yt-search
 require('dotenv').config();
 
-
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -15,7 +14,6 @@ const client = new Client({
 });
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
-
 
 // Creamos una cola para las canciones por servidor
 const queue = new Map();
@@ -77,14 +75,18 @@ client.on('messageCreate', async (message) => {
         queueConstruct.songs.push(song);
 
         try {
-            // Conectamos al canal de voz
-            const connection = joinVoiceChannel({
-                channelId: voiceChannel.id,
-                guildId: message.guild.id,
-                adapterCreator: message.guild.voiceAdapterCreator,
-            });
-
-            queueConstruct.connection = connection;
+            // Verificamos si ya existe una conexión
+            const existingConnection = getVoiceConnection(message.guild.id);
+            if (!existingConnection) {
+                const connection = joinVoiceChannel({
+                    channelId: voiceChannel.id,
+                    guildId: message.guild.id,
+                    adapterCreator: message.guild.voiceAdapterCreator,
+                });
+                queueConstruct.connection = connection;
+            } else {
+                queueConstruct.connection = existingConnection;
+            }
 
             // Comenzamos a reproducir canciones
             playSong(message.guild, queueConstruct.songs[0]);
@@ -162,11 +164,10 @@ function playSong(guild, song) {
             serverQueue.songs.shift();
             playSong(guild, serverQueue.songs[0]);
         } else {
-            serverQueue.connection.destroy(); 
+            serverQueue.connection.destroy();
             queue.delete(guild.id);
         }
     });
-    
 }
 
 client.on('messageCreate', async (message) => {
