@@ -3,19 +3,22 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js"
   },
   "keywords": [],
   "author": "Pablo Romero",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@discordjs/rest": "^2.4.2",
     "@discordjs/voice": "^0.18.0",
-    "@distube/ytdl-core": "^4.15.9",
+    "@distube/ytdl-core": "^4.16.3",
+    "discord-api-types": "^0.37.119",
     "discord.js": "^14.17.3",
     "dotenv": "^16.4.7",
     "ffmpeg-static": "^5.2.0",
-    "opusscript": "^0.0.8",
+    "play-dl": "^1.9.7",
     "yt-search": "^2.12.1"
   }
 }
