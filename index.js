@@ -108,7 +108,10 @@ function playSong(guild, song) {
     if (!serverQueue) return;
 
     if (!song) {
-        serverQueue.textChannel.send('🎵 Esperando más canciones... Usa `/play` para agregar otra.');
+        if (!serverQueue.idleMessageSent) {
+            serverQueue.textChannel.send('🎵 Esperando más canciones... Usa `/play` para agregar otra.');
+            serverQueue.idleMessageSent = true;
+        }
         return;
     }
 
@@ -125,12 +128,14 @@ function playSong(guild, song) {
 
     serverQueue.player.on(AudioPlayerStatus.Idle, () => {
         serverQueue.songs.shift();
+        serverQueue.idleMessageSent = false; // Restablecer para la siguiente espera
         playSong(guild, serverQueue.songs[0]);
     });
 
     serverQueue.player.on('error', (error) => {
         console.error('Error en el reproductor:', error);
         serverQueue.songs.shift();
+        serverQueue.idleMessageSent = false;
         playSong(guild, serverQueue.songs[0]);
     });
 }
