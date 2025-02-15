@@ -104,9 +104,16 @@ client.on('interactionCreate', async (interaction) => {
 function playSong(guild, song) {
     const serverQueue = queue.get(guild.id);
     if (!serverQueue) return;
+
     if (!song) {
-        serverQueue.connection.destroy();
-        queue.delete(guild.id);
+        setTimeout(() => {
+            const currentQueue = queue.get(guild.id);
+            if (currentQueue && currentQueue.songs.length === 0) {
+                serverQueue.connection.destroy();
+                queue.delete(guild.id);
+                serverQueue.textChannel.send('⏹️ No se añadieron más canciones. Desconectando...');
+            }
+        }, 300000); // 300000 ms = 5 minutos
         return;
     }
 
@@ -114,7 +121,6 @@ function playSong(guild, song) {
         filter: 'audioonly',
         quality: 'highestaudio',
         highWaterMark: 1 << 26,
-        dlChunkSize: 0,
     });
 
     const resource = createAudioResource(stream);
