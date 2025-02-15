@@ -62,7 +62,6 @@ client.on('interactionCreate', async (interaction) => {
             };
             queue.set(guild.id, queueConstruct);
             queueConstruct.songs.push(song);
-
             try {
                 const connection = joinVoiceChannel({
                     channelId: voiceChannel.id,
@@ -79,6 +78,9 @@ client.on('interactionCreate', async (interaction) => {
             }
         } else {
             serverQueue.songs.push(song);
+            if (serverQueue.player.state.status === AudioPlayerStatus.Idle) {
+                playSong(guild, serverQueue.songs[0]);
+            }
             return interaction.reply(`🎵 \`${song.title}\` ha sido añadida a la cola.`);
         }
     }
@@ -106,14 +108,7 @@ function playSong(guild, song) {
     if (!serverQueue) return;
 
     if (!song) {
-        setTimeout(() => {
-            const currentQueue = queue.get(guild.id);
-            if (currentQueue && currentQueue.songs.length === 0) {
-                serverQueue.connection.destroy();
-                queue.delete(guild.id);
-                serverQueue.textChannel.send('⏹️ No se añadieron más canciones. Desconectando...');
-            }
-        }, 300000); // 300000 ms = 5 minutos
+        serverQueue.textChannel.send('🎵 Esperando más canciones... Usa `/play` para agregar otra.');
         return;
     }
 
