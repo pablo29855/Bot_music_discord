@@ -108,6 +108,8 @@ function playSong(guild, song) {
     if (!serverQueue) return;
 
     if (!song) {
+        serverQueue.connection.destroy();
+        queue.delete(guild.id);
         return;
     }
 
@@ -118,20 +120,34 @@ function playSong(guild, song) {
     });
 
     const resource = createAudioResource(stream);
+    serverQueue.player.stop(); // Detener cualquier reproducción anterior
+    serverQueue.player.removeAllListeners(); // Evitar fugas de memoria
     serverQueue.player.play(resource);
     serverQueue.connection.subscribe(serverQueue.player);
+
     serverQueue.textChannel.send(`🎶 Reproduciendo: **${song.title}**`);
 
     serverQueue.player.on(AudioPlayerStatus.Idle, () => {
         serverQueue.songs.shift();
-        playSong(guild, serverQueue.songs[0]);
+        if (serverQueue.songs.length > 0) {
+            playSong(guild, serverQueue.songs[0]);
+        } else {
+            serverQueue.connection.destroy();
+            queue.delete(guild.id);
+        }
     });
 
     serverQueue.player.on('error', (error) => {
         console.error('Error en el reproductor:', error);
         serverQueue.songs.shift();
-        playSong(guild, serverQueue.songs[0]);
+        if (serverQueue.songs.length > 0) {
+            playSong(guild, serverQueue.songs[0]);
+        } else {
+            serverQueue.connection.destroy();
+            queue.delete(guild.id);
+        }
     });
 }
+
 
 client.login(TOKEN);
