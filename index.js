@@ -95,15 +95,17 @@ client.on('interactionCreate', async (interaction) => {
         if (serverQueue) {
             serverQueue.songs = [];
             serverQueue.player.stop();
-            serverQueue.connection.destroy();
+            if (serverQueue.connection && serverQueue.connection.state.status !== "destroyed") {
+                serverQueue.connection.destroy();
+            }
             queue.delete(guild.id);
             return interaction.reply('⏹️ Música detenida y bot desconectado.');
         }
         return interaction.reply({ content: 'No hay música en reproducción.', ephemeral: true });
-    }
+    }    
 });
 
-function playSong(guild, song) {
+async function playSong(guild, song) {
     const serverQueue = queue.get(guild.id);
     if (!serverQueue) return;
 
@@ -113,40 +115,40 @@ function playSong(guild, song) {
         return;
     }
 
-    const stream = ytdl(song.url, {
-        filter: 'audioonly',
-        quality: 'highestaudio',
-        highWaterMark: 1 << 26,
-    });
+    try {
+        const stream = ytdl(song.url, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25,
+            requestOptions: { headers: { "User-Agent": "Mozilla/5.0" } } // Evitar bloqueos
+        });
 
-    const resource = createAudioResource(stream);
-    serverQueue.player.stop(); // Detener cualquier reproducción anterior
-    serverQueue.player.removeAllListeners(); // Evitar fugas de memoria
-    serverQueue.player.play(resource);
-    serverQueue.connection.subscribe(serverQueue.player);
+        const resource = createAudioResource(stream);
+        serverQueue.player.play(resource);
+        serverQueue.connection.subscribe(serverQueue.player);
+        serverQueue.textChannel.send(`🎶 Reproduciendo: **${song.title}**`);
 
-    serverQueue.textChannel.send(`🎶 Reproduciendo: **${song.title}**`);
-
-    serverQueue.player.on(AudioPlayerStatus.Idle, () => {
-        serverQueue.songs.shift();
-        if (serverQueue.songs.length > 0) {
+        serverQueue.player.on(AudioPlayerStatus.Idle, () => {
+            serverQueue.songs.shift();
             playSong(guild, serverQueue.songs[0]);
-        } else {
-            serverQueue.connection.destroy();
-            queue.delete(guild.id);
-        }
-    });
+        });
 
-    serverQueue.player.on('error', (error) => {
-        console.error('Error en el reproductor:', error);
-        serverQueue.songs.shift();
-        if (serverQueue.songs.length > 0) {
+        serverQueue.player.on('error', (error) => {
+            console.error('Error en el reproductor:', error);
+
+            if (error.message.includes('Status code: 403')) {
+                serverQueue.textChannel.send('⚠️ Error 403: No se pudo reproducir la canción. Intentando con la siguiente...');
+            }
+
+            serverQueue.songs.shift();
             playSong(guild, serverQueue.songs[0]);
-        } else {
-            serverQueue.connection.destroy();
-            queue.delete(guild.id);
-        }
-    });
+        });
+
+    } catch (error) {
+        console.error('Error al procesar la canción:', error);
+        serverQueue.songs.shift();
+        playSong(guild, serverQueue.songs[0]);
+    }
 }
 
 
