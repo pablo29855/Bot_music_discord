@@ -11,13 +11,17 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@discord-player/extractor": "^7.1.0",
     "@discordjs/rest": "^2.4.2",
     "@discordjs/voice": "^0.18.0",
-    "@distube/ytdl-core": "^4.16.4",
+    "@distube/ytdl-core": "^4.16.10",
     "discord-api-types": "^0.37.119",
-    "discord.js": "^14.17.3",
+    "discord-player": "^7.1.0",
+    "discord.js": "^14.18.0",
     "dotenv": "^16.4.7",
+    "erela.js": "^2.4.0",
     "ffmpeg-static": "^5.2.0",
+    "lavalink-client": "^2.4.7",
     "play-dl": "^1.9.7",
     "yt-search": "^2.12.1"
   }
