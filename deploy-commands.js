@@ -8,7 +8,7 @@ const commands = [
         options: [
             {
                 name: 'cancion',
-                type: 3,
+                type: 3, // STRING
                 description: 'Nombre o URL de la canción',
                 required: true
             }
@@ -21,6 +21,10 @@ const commands = [
     {
         name: 'stop',
         description: 'Detiene la música y desconecta el bot'
+    },
+    {
+        name: 'queue',
+        description: 'Muestra la lista de canciones en la cola'
     }
 ];
 
