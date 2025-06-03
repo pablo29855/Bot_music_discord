@@ -18,6 +18,7 @@ const queue = new Map();
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutos en milisegundos
 const MAX_CONCURRENT_SEARCHES = 10; // Límite de búsquedas concurrentes en YouTube
+const INITIAL_BATCH_SIZE = 10; // Tamaño del lote inicial para reproducción rápida
 
 // Configurar Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -76,6 +77,34 @@ async function searchYouTube(query) {
     }
 }
 
+// Procesar canciones de Spotify en lotes y añadir a la cola
+async function processSpotifyPlaylistTracks(guild, tracks, textChannel, startIndex = 0) {
+    const serverQueue = queue.get(guild.id);
+    if (!serverQueue) return;
+
+    for (let i = startIndex; i < tracks.length; i += MAX_CONCURRENT_SEARCHES) {
+        const batch = tracks.slice(i, i + MAX_CONCURRENT_SEARCHES).map(item => {
+            if (item.track && item.track.name && item.track.artists.length) {
+                const searchQuery = `${item.track.name} ${item.track.artists[0].name}`;
+                return searchYouTube(searchQuery);
+            }
+            return Promise.resolve(null);
+        });
+        const batchResults = await Promise.all(batch);
+        const validSongs = batchResults.filter(song => song);
+        if (validSongs.length) {
+            serverQueue.songs.push(...validSongs);
+            if (i >= INITIAL_BATCH_SIZE && validSongs.length) {
+                textChannel.send(`🎵 Añadidas ${validSongs.length} canciones más a la cola desde la lista de Spotify.`);
+            }
+            // Iniciar reproducción si el reproductor está inactivo
+            if (serverQueue.player.state.status === AudioPlayerStatus.Idle && serverQueue.songs.length > 0) {
+                await playSong(guild, serverQueue.songs[0]);
+            }
+        }
+    }
+}
+
 client.once('ready', async () => {
     console.log(`✅ Bot conectado como ${client.user.tag}`);
     const tokenSuccess = await getSpotifyToken();
@@ -110,6 +139,9 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             let songs = [];
+            let isSpotifyPlaylist = false;
+            let totalTracks = 0;
+
             try {
                 if (songQuery.includes('spotify.com')) {
                     if (songQuery.includes('track/')) {
@@ -132,22 +164,29 @@ client.on('interactionCreate', async (interaction) => {
                         if (!tracks.length) {
                             return interaction.followUp({ content: 'No se encontraron canciones en la lista de reproducción de Spotify.', ephemeral: true });
                         }
+                        totalTracks = tracks.length;
+                        isSpotifyPlaylist = true;
 
-                        const searchPromises = [];
-                        for (let i = 0; i < tracks.length; i += MAX_CONCURRENT_SEARCHES) {
-                            const batch = tracks.slice(i, i + MAX_CONCURRENT_SEARCHES).map(item => {
-                                if (item.track && item.track.name && item.track.artists.length) {
-                                    const searchQuery = `${item.track.name} ${item.track.artists[0].name}`;
-                                    return searchYouTube(searchQuery);
-                                }
-                                return Promise.resolve(null);
-                            });
-                            const batchResults = await Promise.all(batch);
-                            songs.push(...batchResults.filter(song => song));
+                        // Procesar lote inicial
+                        const initialBatch = tracks.slice(0, INITIAL_BATCH_SIZE).map(item => {
+                            if (item.track && item.track.name && item.track.artists.length) {
+                                const searchQuery = `${item.track.name} ${item.track.artists[0].name}`;
+                                return searchYouTube(searchQuery);
+                            }
+                            return Promise.resolve(null);
+                        });
+                        const initialResults = await Promise.all(initialBatch);
+                        songs = initialResults.filter(song => song);
+                        if (!songs.length) {
+                            return interaction.followUp({ content: 'No se encontraron equivalentes en YouTube para las canciones iniciales de la lista.', ephemeral: true });
                         }
 
-                        if (!songs.length) {
-                            return interaction.followUp({ content: 'No se encontraron equivalentes en YouTube para las canciones de la lista de reproducción.', ephemeral: true });
+                        // Iniciar procesamiento en segundo plano
+                        if (tracks.length > INITIAL_BATCH_SIZE) {
+                            processSpotifyPlaylistTracks(guild, tracks, channel, INITIAL_BATCH_SIZE).catch(error => {
+                                console.error('Error al procesar canciones restantes de la lista:', error);
+                                channel.send('⚠️ Error al procesar algunas canciones de la lista de Spotify.');
+                            });
                         }
                     } else {
                         throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
@@ -207,7 +246,7 @@ client.on('interactionCreate', async (interaction) => {
                         queue.delete(guild.id);
                     });
                     await playSong(guild, queueConstruct.songs[0]);
-                    await interaction.followUp(`🎶 Reproduciendo: **${songs[0].title}**${songs.length > 1 ? ` (+${songs.length - 1} canciones de la lista)` : ''}`);
+                    await interaction.followUp(`🎶 Reproduciendo: **${songs[0].title}**${songs.length > 1 || isSpotifyPlaylist ? ` (+${songs.length - 1}${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? ' y más en procesamiento' : ''} canciones de la lista)` : ''}`);
                 } catch (error) {
                     console.error('Error al unirse al canal de voz:', error);
                     queue.delete(guild.id);
@@ -222,7 +261,7 @@ client.on('interactionCreate', async (interaction) => {
                     clearTimeout(serverQueue.idleTimeout);
                     serverQueue.idleTimeout = null;
                 }
-                await interaction.followUp(`🎵 ${songs.length > 1 ? `${songs.length} canciones añadidas a la cola desde la lista.` : `\`${songs[0].title}\` añadida a la cola.`}`);
+                await interaction.followUp(`🎵 ${songs.length > 1 || isSpotifyPlaylist ? `${songs.length} canciones añadidas a la cola${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? ', procesando más en segundo plano.' : '.'}` : `\`${songs[0].title}\` añadida a la cola.`}`);
             }
         }
 
@@ -257,12 +296,10 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             let queueMessage = '**📜 Cola de canciones:**\n';
-            const maxDisplay = 10; // Mostrar hasta 10 canciones para evitar mensajes largos
+            const maxDisplay = 10;
 
-            // Canción actual
             queueMessage += `🎵 **Ahora suena**: \`${serverQueue.songs[0].title}\`\n\n`;
 
-            // Canciones siguientes
             if (serverQueue.songs.length > 1) {
                 queueMessage += '**Siguientes en la cola:**\n';
                 for (let i = 1; i < Math.min(serverQueue.songs.length, maxDisplay + 1); i++) {
@@ -301,13 +338,13 @@ async function playSong(guild, song) {
         const stream = ytdl(song.url, {
             filter: 'audioonly',
             quality: 'highestaudio',
-            highWaterMark: 1 << 26,
+            highWaterMark: 1 << 25, // Reducido a 32MB para mejor manejo
             requestOptions: {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                 }
             },
-            liveBuffer: 10000
+            liveBuffer: 5000 // Reducido para streams más estables
         });
 
         stream.on('error', (error) => {
@@ -319,15 +356,20 @@ async function playSong(guild, song) {
 
         const resource = createAudioResource(stream, {
             inlineVolume: true,
-            metadata: {
-                title: song.title
-            }
+            metadata: { title: song.title },
+            inputType: 'opus', // Forzar codec Opus
+            silencePaddingFrames: 5 // Añadir silencio para transiciones suaves
         });
         resource.volume.setVolume(1.0);
+
+        // Pausa breve para evitar solapamientos
+        await new Promise(resolve => setTimeout(resolve, 500));
+
         serverQueue.player.play(resource);
         serverQueue.connection.subscribe(serverQueue.player);
 
         serverQueue.player.once(AudioPlayerStatus.Idle, () => {
+            console.log(`Canción terminada: ${song.title}`);
             serverQueue.songs.shift();
             playSong(guild, serverQueue.songs[0]);
         });
