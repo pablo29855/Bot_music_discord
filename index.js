@@ -1,8 +1,8 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
-const ytdl = require('@distube/ytdl-core');
 const ytSearch = require('yt-search');
 const SpotifyWebApi = require('spotify-web-api-node');
+const { spawn } = require('child_process');
 require('dotenv').config();
 
 const client = new Client({
@@ -16,9 +16,10 @@ const client = new Client({
 
 const queue = new Map();
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
-const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutos en milisegundos
-const MAX_CONCURRENT_SEARCHES = 10; // Límite de búsquedas concurrentes en YouTube
-const INITIAL_BATCH_SIZE = 10; // Tamaño del lote inicial para reproducción rápida
+const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutos
+const MAX_CONCURRENT_SEARCHES = 10; // Límite de búsquedas simultáneas
+const INITIAL_BATCH_SIZE = 10; // Lote inicial para playlists
+const MAX_PLAYLIST_ITEMS = 50; // Límite de canciones por playlist
 
 // Configurar Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -26,7 +27,106 @@ const spotifyApi = new SpotifyWebApi({
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET
 });
 
-// Obtener token de acceso para Spotify
+// Función para barajar un array (Fisher-Yates shuffle)
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
+
+// Función para eliminar duplicados basados en URL
+function removeDuplicates(songs) {
+    const seen = new Set();
+    return songs.filter(song => {
+        if (seen.has(song.url)) return false;
+        seen.add(song.url);
+        return true;
+    });
+}
+
+// Ejecutar yt-dlp asíncronamente
+function runYTDLP(args, url) {
+    return new Promise((resolve, reject) => {
+        const ytdlp = spawn('yt-dlp', [...args, url], { shell: true });
+        let output = '';
+        let errorOutput = '';
+
+        ytdlp.stdout.on('data', (data) => {
+            output += data.toString();
+        });
+
+        ytdlp.stderr.on('data', (data) => {
+            errorOutput += data.toString();
+        });
+
+        ytdlp.on('close', (code) => {
+            if (code === 0) {
+                resolve(output.trim());
+            } else {
+                reject(new Error(`yt-dlp falló con código ${code}: ${errorOutput}`));
+            }
+        });
+
+        ytdlp.on('error', (error) => {
+            reject(new Error(`Error al ejecutar yt-dlp: ${error.message}`));
+        });
+    });
+}
+
+// Obtener URL del stream
+async function getStreamURL(url) {
+    try {
+        const streamURL = await runYTDLP(['--no-warnings', '-f', 'bestaudio', '--get-url'], url);
+        return streamURL;
+    } catch (error) {
+        console.error(`Error al obtener stream URL para ${url}:`, error);
+        return null;
+    }
+}
+
+// Obtener información de una canción o playlist
+async function getSongInfo(url) {
+    try {
+        const isPlaylist = url.includes('list=') || url.includes('playlist?');
+        const args = isPlaylist
+            ? ['--no-warnings', '--dump-json', '--playlist-end', MAX_PLAYLIST_ITEMS.toString()]
+            : ['--no-warnings', '--dump-json'];
+
+        const output = await runYTDLP(args, url);
+        const lines = output.split('\n').filter(line => line.trim());
+        const infos = lines.map(line => {
+            try {
+                return JSON.parse(line);
+            } catch (e) {
+                console.error(`Error al parsear JSON para ${url}:`, e);
+                return null;
+            }
+        }).filter(info => info);
+
+        if (infos.length === 0) {
+            throw new Error('No se obtuvo información válida de yt-dlp');
+        }
+
+        let songs = infos.map(info => ({
+            title: info.title || 'Canción sin título',
+            url: info.webpage_url || `https://www.youtube.com/watch?v=${info.id}`
+        }));
+
+        // Barajar y eliminar duplicados si es una playlist
+        if (isPlaylist) {
+            songs = removeDuplicates(shuffleArray(songs));
+        }
+
+        return songs;
+    } catch (error) {
+        console.error(`Error al obtener información para ${url}:`, error);
+        return null;
+    }
+}
+
+// Obtener token de Spotify
 async function getSpotifyToken() {
     try {
         const data = await spotifyApi.clientCredentialsGrant();
@@ -38,11 +138,11 @@ async function getSpotifyToken() {
     }
 }
 
-// Obtener todas las canciones de una lista de reproducción con paginación paralela
+// Obtener canciones de una playlist de Spotify
 async function getAllPlaylistTracks(playlistId) {
     try {
         const playlistInfo = await spotifyApi.getPlaylist(playlistId, { fields: 'tracks(total)' });
-        const totalTracks = playlistInfo.body.tracks.total;
+        const totalTracks = Math.min(playlistInfo.body.tracks.total, MAX_PLAYLIST_ITEMS);
         const limit = 100;
         const pages = Math.ceil(totalTracks / limit);
 
@@ -52,18 +152,19 @@ async function getAllPlaylistTracks(playlistId) {
         }
 
         const responses = await Promise.all(pagePromises);
-        const tracks = responses.flatMap(response => response.body.items);
-        return tracks;
+        let tracks = responses.flatMap(response => response.body.items);
+        tracks = tracks.slice(0, MAX_PLAYLIST_ITEMS);
+        return shuffleArray(tracks); // Barajar las pistas de Spotify
     } catch (error) {
         console.error(`Error al obtener canciones de la lista ${playlistId}:`, error);
         if (error.statusCode === 404) {
-            throw new Error('Lista de reproducción no encontrada o no accesible. Verifica que la URL sea correcta y que la lista sea pública.');
+            throw new Error('Lista de reproducción no encontrada o no accesible.');
         }
         throw error;
     }
 }
 
-// Buscar una canción en YouTube
+// Buscar canción en YouTube
 async function searchYouTube(query) {
     try {
         const searchResults = await ytSearch(query);
@@ -77,7 +178,7 @@ async function searchYouTube(query) {
     }
 }
 
-// Procesar canciones de Spotify en lotes y añadir a la cola
+// Procesar canciones de Spotify en lotes
 async function processSpotifyPlaylistTracks(guild, tracks, textChannel, startIndex = 0) {
     const serverQueue = queue.get(guild.id);
     if (!serverQueue) return;
@@ -91,13 +192,13 @@ async function processSpotifyPlaylistTracks(guild, tracks, textChannel, startInd
             return Promise.resolve(null);
         });
         const batchResults = await Promise.all(batch);
-        const validSongs = batchResults.filter(song => song);
+        let validSongs = batchResults.filter(song => song);
+        validSongs = removeDuplicates(validSongs); // Eliminar duplicados en el lote
         if (validSongs.length) {
             serverQueue.songs.push(...validSongs);
             if (i >= INITIAL_BATCH_SIZE && validSongs.length) {
                 textChannel.send(`🎵 Añadidas ${validSongs.length} canciones más a la cola desde la lista de Spotify.`);
             }
-            // Iniciar reproducción si el reproductor está inactivo
             if (serverQueue.player.state.status === AudioPlayerStatus.Idle && serverQueue.songs.length > 0) {
                 await playSong(guild, serverQueue.songs[0]);
             }
@@ -167,7 +268,6 @@ client.on('interactionCreate', async (interaction) => {
                         totalTracks = tracks.length;
                         isSpotifyPlaylist = true;
 
-                        // Procesar lote inicial
                         const initialBatch = tracks.slice(0, INITIAL_BATCH_SIZE).map(item => {
                             if (item.track && item.track.name && item.track.artists.length) {
                                 const searchQuery = `${item.track.name} ${item.track.artists[0].name}`;
@@ -176,12 +276,11 @@ client.on('interactionCreate', async (interaction) => {
                             return Promise.resolve(null);
                         });
                         const initialResults = await Promise.all(initialBatch);
-                        songs = initialResults.filter(song => song);
+                        songs = removeDuplicates(initialResults.filter(song => song));
                         if (!songs.length) {
                             return interaction.followUp({ content: 'No se encontraron equivalentes en YouTube para las canciones iniciales de la lista.', ephemeral: true });
                         }
 
-                        // Iniciar procesamiento en segundo plano
                         if (tracks.length > INITIAL_BATCH_SIZE) {
                             processSpotifyPlaylistTracks(guild, tracks, channel, INITIAL_BATCH_SIZE).catch(error => {
                                 console.error('Error al procesar canciones restantes de la lista:', error);
@@ -191,34 +290,33 @@ client.on('interactionCreate', async (interaction) => {
                     } else {
                         throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
                     }
-                } else if (ytdl.validateURL(songQuery)) {
-                    if (songQuery.includes('list=')) {
-                        const playlistInfo = await ytdl.getInfo(songQuery);
-                        const playlistVideos = playlistInfo.related_videos || [];
-                        if (!playlistVideos.length) {
-                            return interaction.followUp({ content: 'No se encontraron videos en la lista de reproducción de YouTube.', ephemeral: true });
-                        }
-                        songs = playlistVideos
-                            .filter(video => video && video.id && video.title)
-                            .map(video => ({
-                                title: video.title,
-                                url: `https://www.youtube.com/watch?v=${video.id}`
-                            }));
-                    } else {
-                        const info = await ytdl.getInfo(songQuery);
-                        songs = [{ title: info.videoDetails.title, url: songQuery }];
+                } else if (songQuery.includes('youtube.com') || songQuery.includes('youtu.be')) {
+                    const songInfo = await getSongInfo(songQuery);
+                    if (!songInfo) {
+                        return interaction.followUp({ content: 'No se encontraron resultados para la URL de YouTube.', ephemeral: true });
                     }
+                    songs = songInfo;
                 } else {
-                    const searchResults = await ytSearch(songQuery);
-                    if (!searchResults.videos.length) {
+                    // Búsqueda por nombre
+                    const song = await searchYouTube(songQuery);
+                    if (!song) {
                         return interaction.followUp({ content: 'No se encontraron resultados para tu búsqueda.', ephemeral: true });
                     }
-                    const firstResult = searchResults.videos[0];
-                    songs = [{ title: firstResult.title, url: firstResult.url }];
+                    songs = [song];
                 }
             } catch (error) {
                 console.error('Error al buscar la canción o lista de reproducción:', error);
                 return interaction.followUp({ content: error.message || 'Hubo un error al buscar la canción o lista de reproducción.', ephemeral: true });
+            }
+
+            // Eliminar duplicados de la cola existente
+            if (serverQueue) {
+                const existingURLs = new Set(serverQueue.songs.map(song => song.url));
+                songs = songs.filter(song => !existingURLs.has(song.url));
+            }
+
+            if (!songs.length) {
+                return interaction.followUp({ content: 'No se añadieron canciones nuevas (posiblemente duplicadas).', ephemeral: true });
             }
 
             if (!serverQueue) {
@@ -335,34 +433,21 @@ async function playSong(guild, song) {
     }
 
     try {
-        const stream = ytdl(song.url, {
-            filter: 'audioonly',
-            quality: 'highestaudio',
-            highWaterMark: 1 << 25, // Reducido a 32MB para mejor manejo
-            requestOptions: {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
-            },
-            liveBuffer: 5000 // Reducido para streams más estables
-        });
-
-        stream.on('error', (error) => {
-            console.error('Error en el stream:', error);
-            serverQueue.textChannel.send('⚠️ Error al transmitir la canción. Pasando a la siguiente...');
+        const streamURL = await getStreamURL(song.url);
+        if (!streamURL) {
+            serverQueue.textChannel.send('⚠️ Error al obtener el stream de la canción. Pasando a la siguiente...');
             serverQueue.songs.shift();
-            playSong(guild, serverQueue.songs[0]);
-        });
+            return playSong(guild, serverQueue.songs[0]);
+        }
 
-        const resource = createAudioResource(stream, {
+        const resource = createAudioResource(streamURL, {
             inlineVolume: true,
             metadata: { title: song.title },
-            inputType: 'opus', // Forzar codec Opus
-            silencePaddingFrames: 5 // Añadir silencio para transiciones suaves
+            inputType: 'opus',
+            silencePaddingFrames: 5
         });
         resource.volume.setVolume(1.0);
 
-        // Pausa breve para evitar solapamientos
         await new Promise(resolve => setTimeout(resolve, 500));
 
         serverQueue.player.play(resource);
