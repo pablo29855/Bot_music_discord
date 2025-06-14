@@ -18,14 +18,16 @@ const client = new Client({
 const queue = new Map();
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutos
-const MAX_CONCURRENT_SEARCHES = 10; // Límite de búsquedas simultáneas
-const INITIAL_BATCH_SIZE = 10; // Lote inicial para playlists
+const MAX_CONCURRENT_SEARCHES = 5; // Límite de búsquedas simultáneas
+const INITIAL_BATCH_SIZE = 5; // Lote inicial para playlists
 const MAX_PLAYLIST_ITEMS = 50; // Límite de canciones por playlist
-const CACHE_TTL = 3600; // 1 hora en segundos para caché
+const CACHE_TTL_STREAM = 3600; // 1 hora para streams
+const CACHE_TTL_SEARCH = 24 * 3600; // 24 horas para búsquedas
+const YTDLP_TIMEOUT = 30 * 1000; // 30 segundos de timeout para yt-dlp
 
-// Caché para resultados de yt-dlp y búsquedas de YouTube
-const streamCache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 600 });
-const searchCache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 600 });
+// Caché optimizado
+const streamCache = new NodeCache({ stdTTL: CACHE_TTL_STREAM, checkperiod: 600, maxKeys: 1000 });
+const searchCache = new NodeCache({ stdTTL: CACHE_TTL_SEARCH, checkperiod: 600, maxKeys: 5000 });
 
 // Configurar Spotify API
 const spotifyApi = new SpotifyWebApi({
@@ -33,7 +35,7 @@ const spotifyApi = new SpotifyWebApi({
     clientSecret: process.env.SPOTIFY_CLIENT_SECRET
 });
 
-// Cola de tareas para procesar canciones en segundo plano
+// Cola de tareas
 const taskQueue = new Map();
 
 function shuffleArray(array) {
@@ -53,11 +55,28 @@ function removeDuplicates(songs) {
     });
 }
 
+// Función para limpiar URLs de parámetros innecesarios
+function cleanYouTubeURL(url) {
+    try {
+        const urlObj = new URL(url);
+        const cleanURL = `${urlObj.origin}${urlObj.pathname}?v=${urlObj.searchParams.get('v')}`;
+        return cleanURL;
+    } catch (error) {
+        console.error(`Error al limpiar URL ${url}:`, error);
+        return url; // Devolver URL original si falla
+    }
+}
+
 function runYTDLP(args, url) {
     return new Promise((resolve, reject) => {
-        const ytdlp = spawn('yt-dlp', [...args, url], { shell: true });
+        const ytdlp = spawn('yt-dlp', [...args, url], { shell: false });
         let output = '';
         let errorOutput = '';
+
+        const timeout = setTimeout(() => {
+            ytdlp.kill();
+            reject(new Error('yt-dlp timeout después de 30 segundos'));
+        }, YTDLP_TIMEOUT);
 
         ytdlp.stdout.on('data', (data) => {
             output += data.toString();
@@ -68,6 +87,7 @@ function runYTDLP(args, url) {
         });
 
         ytdlp.on('close', (code) => {
+            clearTimeout(timeout);
             if (code === 0) {
                 resolve(output.trim());
             } else {
@@ -76,44 +96,46 @@ function runYTDLP(args, url) {
         });
 
         ytdlp.on('error', (error) => {
+            clearTimeout(timeout);
             reject(new Error(`Error al ejecutar yt-dlp: ${error.message}`));
         });
     });
 }
 
 async function getStreamURL(url) {
-    const cacheKey = `stream:${url}`;
+    const cleanedURL = cleanYouTubeURL(url);
+    const cacheKey = `stream:${cleanedURL}`;
     if (streamCache.has(cacheKey)) {
         return streamCache.get(cacheKey);
     }
     try {
-        const streamURL = await runYTDLP(['--no-warnings', '-f', 'bestaudio', '--get-url'], url);
+        const streamURL = await runYTDLP(['--no-warnings', '-f', 'bestaudio', '--no-playlist', '--get-url'], cleanedURL);
         streamCache.set(cacheKey, streamURL);
         return streamURL;
     } catch (error) {
-        console.error(`Error al obtener stream URL para ${url}:`, error);
+        console.error(`Error al obtener stream URL para ${cleanedURL}:`, error);
         return null;
     }
 }
 
-async function getSongInfo(url) {
-    const cacheKey = `info:${url}`;
+async function getSongInfo(url, isPlaylist = false) {
+    const cleanedURL = isPlaylist ? url : cleanYouTubeURL(url);
+    const cacheKey = `info:${cleanedURL}`;
     if (streamCache.has(cacheKey)) {
         return streamCache.get(cacheKey);
     }
     try {
-        const isPlaylist = url.includes('list=') || url.includes('playlist?');
         const args = isPlaylist
             ? ['--no-warnings', '--dump-json', '--playlist-end', MAX_PLAYLIST_ITEMS.toString()]
-            : ['--no-warnings', '--dump-json'];
+            : ['--no-warnings', '--no-playlist', '--dump-json'];
 
-        const output = await runYTDLP(args, url);
+        const output = await runYTDLP(args, cleanedURL);
         const lines = output.split('\n').filter(line => line.trim());
         const infos = lines.map(line => {
             try {
                 return JSON.parse(line);
             } catch (e) {
-                console.error(`Error al parsear JSON para ${url}:`, e);
+                console.error(`Error al parsear JSON para ${cleanedURL}:`, e);
                 return null;
             }
         }).filter(info => info);
@@ -134,7 +156,7 @@ async function getSongInfo(url) {
         streamCache.set(cacheKey, songs);
         return songs;
     } catch (error) {
-        console.error(`Error al obtener información para ${url}:`, error);
+        console.error(`Error al obtener información para ${cleanedURL}:`, error);
         return null;
     }
 }
@@ -154,7 +176,7 @@ async function getAllPlaylistTracks(playlistId) {
     try {
         const playlistInfo = await spotifyApi.getPlaylist(playlistId, { fields: 'tracks(total)' });
         const totalTracks = Math.min(playlistInfo.body.tracks.total, MAX_PLAYLIST_ITEMS);
-        const limit = 100;
+        const limit = 50;
         const pages = Math.ceil(totalTracks / limit);
 
         const pagePromises = [];
@@ -214,8 +236,8 @@ async function processSpotifyPlaylistTracks(guildId, tracks, textChannel, startI
             if (i >= INITIAL_BATCH_SIZE && validSongs.length) {
                 textChannel.send(`🎵 Añadidas ${validSongs.length} canciones más a la cola desde la lista de Spotify.`);
             }
-            if (serverQueue.songs.length === validSongs.length + 1) {
-                preloadNextSong(guildId); // Preload para la primera canción añadida
+            if (serverQueue.songs.length <= 2) {
+                preloadNextSong(guildId);
             }
         }
     }
@@ -348,9 +370,10 @@ client.on('interactionCreate', async (interaction) => {
                             throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
                         }
                     } else if (songQuery.includes('youtube.com') || songQuery.includes('youtu.be')) {
-                        const songInfo = await getSongInfo(songQuery);
+                        const isPlaylist = songQuery.includes('list=') && songQuery.includes('playlist?');
+                        const songInfo = await getSongInfo(songQuery, isPlaylist);
                         if (!songInfo) {
-                            throw new Error('No se encontraron resultados para la URL de YouTube.');
+                            throw new Error('No se encontraron resultados para la URL de YouTube. Verifica que la URL sea válida.');
                         }
                         songs = songInfo;
                     } else {
@@ -362,7 +385,7 @@ client.on('interactionCreate', async (interaction) => {
                     }
                 } catch (error) {
                     console.error('Error al buscar la canción o lista de reproducción:', error);
-                    await interaction.followUp({ content: error.message || 'Hubo un error al buscar la canción o lista de reproducción.', ephemeral: true });
+                    await interaction.followUp({ content: error.message || 'Hubo un error al buscar la canción o lista de reproducción. Intenta con otra URL o búsqueda.', ephemeral: true });
                     return;
                 }
 
@@ -372,7 +395,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
 
                 if (!songs.length) {
-                    await interaction.followUp({ content: 'No se añadieron canciones nuevas (posiblemente duplicadas).', ephemeral: true });
+                    await interaction.followUp({ content: 'No se añadieron canciones nuevas (posiblemente duplicadas o no disponibles).', ephemeral: true });
                     return;
                 }
 
@@ -412,7 +435,7 @@ client.on('interactionCreate', async (interaction) => {
                     serverQueue.songs.push(...songs);
                     if (serverQueue.player.state.status === AudioPlayerStatus.Idle) {
                         await playSong(guild.id, serverQueue.songs[0]);
-                    } else {
+                    } else if (serverQueue.songs.length <= 2) {
                         preloadNextSong(guild.id);
                     }
                     if (serverQueue.idleTimeout) {
@@ -428,7 +451,13 @@ client.on('interactionCreate', async (interaction) => {
             if (!serverQueue) {
                 return interaction.reply({ content: 'No hay canciones en la cola para saltar.', ephemeral: true });
             }
-            serverQueue.player.stop();
+            // Forzar parada completa del reproductor
+            serverQueue.player.stop(true);
+            // Limpiar suscripciones activas
+            if (serverQueue.connection) {
+                serverQueue.connection.removeAllListeners();
+                serverQueue.connection.subscribe(serverQueue.player);
+            }
             await interaction.reply('⏭️ Canción saltada.');
         }
 
@@ -437,7 +466,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: 'No hay música en reproducción.', ephemeral: true });
             }
             serverQueue.songs = [];
-            serverQueue.player.stop();
+            serverQueue.player.stop(true);
             if (serverQueue.connection && serverQueue.connection.state.status !== 'destroyed') {
                 serverQueue.connection.destroy();
             }
@@ -475,7 +504,7 @@ client.on('interactionCreate', async (interaction) => {
         }
     } catch (error) {
         console.error('Error en la interacción:', error);
-        await interaction.reply({ content: 'Ocurrió un error inesperado.', ephemeral: true }).catch(console.error);
+        await interaction.reply({ content: 'Ocurrió un error inesperado. Intenta de nuevo.', ephemeral: true }).catch(console.error);
     }
 });
 
@@ -496,6 +525,13 @@ async function playSong(guildId, song) {
     }
 
     try {
+        // Limpiar suscripciones previas y detener el reproductor
+        serverQueue.player.stop(true);
+        if (serverQueue.connection) {
+            serverQueue.connection.removeAllListeners();
+            serverQueue.connection.subscribe(serverQueue.player);
+        }
+
         const streamURL = serverQueue.preloadedStream && serverQueue.songs[0].url === song.url ? serverQueue.preloadedStream : await getStreamURL(song.url);
         serverQueue.preloadedStream = null; // Limpiar precarga
         if (!streamURL) {
@@ -511,6 +547,9 @@ async function playSong(guildId, song) {
             silencePaddingFrames: 5
         });
         resource.volume.setVolume(1.0);
+
+        // Pequeño retraso para asegurar que el stream anterior esté limpio
+        await new Promise(resolve => setTimeout(resolve, 200));
 
         serverQueue.player.play(resource);
         serverQueue.connection.subscribe(serverQueue.player);
@@ -529,7 +568,9 @@ async function playSong(guildId, song) {
         });
 
         serverQueue.textChannel.send(`🎶 Reproduciendo: **${song.title}**`);
-        preloadNextSong(guildId); // Precargar la siguiente canción
+        if (serverQueue.songs.length <= 2) {
+            preloadNextSong(guildId);
+        }
     } catch (error) {
         console.error('Error al reproducir la canción:', error);
         serverQueue.textChannel.send('⚠️ Error al procesar la canción. Pasando a la siguiente...');
