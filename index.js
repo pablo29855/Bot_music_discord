@@ -1,5 +1,5 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
 const ytSearch = require('yt-search');
 const SpotifyWebApi = require('spotify-web-api-node');
 const { spawn } = require('child_process');
@@ -55,15 +55,44 @@ function removeDuplicates(songs) {
     });
 }
 
-// Función para limpiar URLs de parámetros innecesarios
 function cleanYouTubeURL(url) {
     try {
         const urlObj = new URL(url);
         const cleanURL = `${urlObj.origin}${urlObj.pathname}?v=${urlObj.searchParams.get('v')}`;
         return cleanURL;
     } catch (error) {
-        console.error(`Error al limpiar URL ${url}:`, error);
-        return url; // Devolver URL original si falla
+        console.error(`Error al limpiar URL ${url}: ${error.message}`);
+        return url;
+    }
+}
+
+function getYouTubeIds(url) {
+    try {
+        const urlObj = new URL(url);
+        return {
+            videoId: urlObj.searchParams.get('v') || null,
+            playlistId: urlObj.searchParams.get('list') || null
+        };
+    } catch (error) {
+        console.error(`Error al extraer IDs de ${url}: ${error.message}`);
+        return { videoId: null, playlistId: null };
+    }
+}
+
+async function getRelatedSongs(videoTitle, limit = 10) {
+    try {
+        const searchResults = await ytSearch(videoTitle);
+        if (searchResults.videos.length) {
+            const songs = searchResults.videos.slice(0, Math.min(limit, MAX_PLAYLIST_ITEMS)).map(video => ({
+                title: video.title,
+                url: video.url
+            }));
+            return removeDuplicates(shuffleArray(songs));
+        }
+        return [];
+    } catch (error) {
+        console.error(`Error al buscar canciones relacionadas para "${videoTitle}": ${error.message}`);
+        return [];
     }
 }
 
@@ -109,11 +138,19 @@ async function getStreamURL(url) {
         return streamCache.get(cacheKey);
     }
     try {
-        const streamURL = await runYTDLP(['--no-warnings', '-f', 'bestaudio', '--no-playlist', '--get-url'], cleanedURL);
+        const streamURL = await runYTDLP([
+            '--no-warnings',
+            '-f', 'bestaudio[ext=opus]/bestaudio[acodec=opus]/bestaudio',
+            '--no-playlist',
+            '--get-url',
+            '--http-chunk-size', '10M',
+            '--retries', '3',
+            '--retry-sleep', '5'
+        ], cleanedURL);
         streamCache.set(cacheKey, streamURL);
         return streamURL;
     } catch (error) {
-        console.error(`Error al obtener stream URL para ${cleanedURL}:`, error);
+        console.error(`Error al obtener stream URL para ${cleanedURL}: ${error.message}`);
         return null;
     }
 }
@@ -135,7 +172,7 @@ async function getSongInfo(url, isPlaylist = false) {
             try {
                 return JSON.parse(line);
             } catch (e) {
-                console.error(`Error al parsear JSON para ${cleanedURL}:`, e);
+                console.error(`Error al parsear JSON para ${cleanedURL}: ${e.message}`);
                 return null;
             }
         }).filter(info => info);
@@ -156,7 +193,7 @@ async function getSongInfo(url, isPlaylist = false) {
         streamCache.set(cacheKey, songs);
         return songs;
     } catch (error) {
-        console.error(`Error al obtener información para ${cleanedURL}:`, error);
+        console.error(`Error al obtener información para ${cleanedURL}: ${error.message}`);
         return null;
     }
 }
@@ -167,7 +204,7 @@ async function getSpotifyToken() {
         spotifyApi.setAccessToken(data.body['access_token']);
         return true;
     } catch (error) {
-        console.error('Error al obtener token de Spotify:', error);
+        console.error(`Error al obtener token de Spotify: ${error.message}`);
         return false;
     }
 }
@@ -189,7 +226,7 @@ async function getAllPlaylistTracks(playlistId) {
         tracks = tracks.slice(0, MAX_PLAYLIST_ITEMS);
         return shuffleArray(tracks);
     } catch (error) {
-        console.error(`Error al obtener canciones de la lista ${playlistId}:`, error);
+        console.error(`Error al obtener canciones de la lista ${playlistId}: ${error.message}`);
         if (error.statusCode === 404) {
             throw new Error('Lista de reproducción no encontrada o no accesible.');
         }
@@ -211,7 +248,7 @@ async function searchYouTube(query) {
         }
         return null;
     } catch (error) {
-        console.error(`Error al buscar en YouTube: ${query}`, error);
+        console.error(`Error al buscar en YouTube: ${query}`, error.message);
         return null;
     }
 }
@@ -254,7 +291,7 @@ async function preloadNextSong(guildId) {
             serverQueue.preloadedStream = streamURL;
         }
     } catch (error) {
-        console.error(`Error al precargar stream para ${nextSong.url}:`, error);
+        console.error(`Error al precargar stream para ${nextSong.url}: ${error.message}`);
     }
 }
 
@@ -276,7 +313,7 @@ async function processNextTask(guildId) {
     try {
         await task();
     } catch (error) {
-        console.error(`Error al procesar tarea para guild ${guildId}:`, error);
+        console.error(`Error al procesar tarea para guild ${guildId}: ${error.message}`);
     } finally {
         tasks.shift();
         if (tasks.length > 0) {
@@ -291,7 +328,7 @@ client.once('ready', async () => {
     console.log(`✅ Bot conectado como ${client.user.tag}`);
     const tokenSuccess = await getSpotifyToken();
     if (!tokenSuccess) {
-        console.error('No se pudo iniciar la integración con Spotify. El bot seguirá funcionando para YouTube.');
+        console.error(`No se pudo iniciar la integración con Spotify. El bot seguirá funcionando para YouTube.`);
     }
 });
 
@@ -370,12 +407,33 @@ client.on('interactionCreate', async (interaction) => {
                             throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
                         }
                     } else if (songQuery.includes('youtube.com') || songQuery.includes('youtu.be')) {
-                        const isPlaylist = songQuery.includes('list=') && songQuery.includes('playlist?');
-                        const songInfo = await getSongInfo(songQuery, isPlaylist);
-                        if (!songInfo) {
-                            throw new Error('No se encontraron resultados para la URL de YouTube. Verifica que la URL sea válida.');
+                        const { videoId, playlistId } = getYouTubeIds(songQuery);
+                        if (playlistId && playlistId.startsWith('RD')) {
+                            if (!videoId) throw new Error('No se encontró un ID de video válido en la URL.');
+                            const singleSongInfo = await getSongInfo(`https://www.youtube.com/watch?v=${videoId}`, false);
+                            if (!singleSongInfo) {
+                                throw new Error('No se pudo obtener información del video inicial.');
+                            }
+                            songs = singleSongInfo;
+                            const relatedSongs = await getRelatedSongs(songs[0].title, 10);
+                            if (relatedSongs.length) {
+                                songs.push(...relatedSongs);
+                                await interaction.followUp(`⚠️ La lista dinámica de YouTube no es accesible directamente. Reproduciendo la canción inicial y añadiendo ${relatedSongs.length} canciones relacionadas.`);
+                            }
+                        } else if (playlistId) {
+                            const playlistURL = `https://www.youtube.com/playlist?list=${playlistId}`;
+                            const songInfo = await getSongInfo(playlistURL, true);
+                            if (!songInfo) {
+                                throw new Error('No se encontraron resultados para la lista de reproducción de YouTube.');
+                            }
+                            songs = songInfo;
+                        } else {
+                            const songInfo = await getSongInfo(songQuery, false);
+                            if (!songInfo) {
+                                throw new Error('No se encontraron resultados para la URL de YouTube.');
+                            }
+                            songs = songInfo;
                         }
-                        songs = songInfo;
                     } else {
                         const song = await searchYouTube(songQuery);
                         if (!song) {
@@ -384,7 +442,7 @@ client.on('interactionCreate', async (interaction) => {
                         songs = [song];
                     }
                 } catch (error) {
-                    console.error('Error al buscar la canción o lista de reproducción:', error);
+                    console.error(`Error al buscar la canción o lista de reproducción: ${error.message}`);
                     await interaction.followUp({ content: error.message || 'Hubo un error al buscar la canción o lista de reproducción. Intenta con otra URL o búsqueda.', ephemeral: true });
                     return;
                 }
@@ -419,15 +477,39 @@ client.on('interactionCreate', async (interaction) => {
                             adapterCreator: guild.voiceAdapterCreator,
                         });
                         queueConstruct.connection = connection;
+
+                        connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                            try {
+                                await Promise.race([
+                                    connection.reconnect(),
+                                    new Promise((_, reject) => setTimeout(() => reject(new Error('Reconexión fallida')), 5000))
+                                ]);
+                                console.log(`Reconectado al canal de voz en ${guild.id}`);
+                            } catch {
+                                connection.destroy();
+                                queue.delete(guild.id);
+                                channel.send('⚠️ Desconectado del canal de voz. Usa /play para reconectar.');
+                            }
+                        });
+
                         connection.on('error', (error) => {
-                            console.error('Error en la conexión de voz:', error);
+                            console.error(`Error en la conexión de voz: ${error.message}`);
                             queueConstruct.textChannel.send('⚠️ Error en la conexión de voz. Por favor, intenta de nuevo.');
                             queue.delete(guild.id);
                         });
+
                         await playSong(guild.id, queueConstruct.songs[0]);
-                        await interaction.followUp(`🎶 Reproduciendo: **${songs[0].title}**${songs.length > 1 || isSpotifyPlaylist ? ` (+${songs.length - 1}${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? ' y más en procesamiento' : ''} canciones de la lista)` : ''}`);
+                        let message = `🎶 Reproduciendo: **${songs[0].title}**`;
+                        if (songs.length > 1 || isSpotifyPlaylist) {
+                            message += ` (+${songs.length - 1} canciones de la lista`;
+                            if (isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE) {
+                                message += ', y más en procesamiento';
+                            }
+                            message += ')';
+                        }
+                        await interaction.followUp(message);
                     } catch (error) {
-                        console.error('Error al unirse al canal de voz:', error);
+                        console.error(`Error al unirse al canal de voz: ${error.message}`);
                         queue.delete(guild.id);
                         await interaction.followUp({ content: 'Hubo un error al unirme al canal de voz.', ephemeral: true });
                     }
@@ -442,26 +524,31 @@ client.on('interactionCreate', async (interaction) => {
                         clearTimeout(serverQueue.idleTimeout);
                         serverQueue.idleTimeout = null;
                     }
-                    await interaction.followUp(`🎵 ${songs.length > 1 || isSpotifyPlaylist ? `${songs.length} canciones añadidas a la cola${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? ', procesando más en segundo plano.' : '.'}` : `\`${songs[0].title}\` añadida a la cola.`}`);
+                    let message = '🎵 ';
+                    if (songs.length > 1 || isSpotifyPlaylist) {
+                        message += `${songs.length} canciones añadidas a la cola`;
+                        if (isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE) {
+                            message += ', procesando más en segundo plano.';
+                        } else {
+                            message += '.';
+                        }
+                    } else {
+                        message += `\`${songs[0].title}\` añadida a la cola.`;
+                    }
+                    await interaction.followUp(message);
                 }
             });
-        }
-
-        if (commandName === 'skip') {
+        } else if (commandName === 'skip') {
             if (!serverQueue) {
                 return interaction.reply({ content: 'No hay canciones en la cola para saltar.', ephemeral: true });
             }
-            // Forzar parada completa del reproductor
             serverQueue.player.stop(true);
-            // Limpiar suscripciones activas
             if (serverQueue.connection) {
-                serverQueue.connection.removeAllListeners();
+                serverQueue.connection.removeAllListeners('subscription');
                 serverQueue.connection.subscribe(serverQueue.player);
             }
-            await interaction.reply('⏭️ Canción saltada.');
-        }
-
-        if (commandName === 'stop') {
+            await interaction.reply('⏩ Canción saltada.');
+        } else if (commandName === 'stop') {
             if (!serverQueue) {
                 return interaction.reply({ content: 'No hay música en reproducción.', ephemeral: true });
             }
@@ -477,14 +564,12 @@ client.on('interactionCreate', async (interaction) => {
             queue.delete(guild.id);
             taskQueue.delete(guild.id);
             await interaction.reply('⏹️ Música detenida y cola vaciada.');
-        }
-
-        if (commandName === 'queue') {
+        } else if (commandName === 'queue') {
             if (!serverQueue || !serverQueue.songs.length) {
                 return interaction.reply({ content: '📭 La cola está vacía.', ephemeral: true });
             }
 
-            let queueMessage = '**📜 Cola de canciones:**\n';
+            let queueMessage = '**📜 Cola de canciones:**\n\n';
             const maxDisplay = 10;
 
             queueMessage += `🎵 **Ahora suena**: \`${serverQueue.songs[0].title}\`\n\n`;
@@ -503,7 +588,7 @@ client.on('interactionCreate', async (interaction) => {
             await interaction.reply(queueMessage);
         }
     } catch (error) {
-        console.error('Error en la interacción:', error);
+        console.error(`Error en la interacción: ${error.message}`);
         await interaction.reply({ content: 'Ocurrió un error inesperado. Intenta de nuevo.', ephemeral: true }).catch(console.error);
     }
 });
@@ -525,15 +610,14 @@ async function playSong(guildId, song) {
     }
 
     try {
-        // Limpiar suscripciones previas y detener el reproductor
         serverQueue.player.stop(true);
         if (serverQueue.connection) {
-            serverQueue.connection.removeAllListeners();
+            serverQueue.connection.removeAllListeners('subscription');
             serverQueue.connection.subscribe(serverQueue.player);
         }
 
         const streamURL = serverQueue.preloadedStream && serverQueue.songs[0].url === song.url ? serverQueue.preloadedStream : await getStreamURL(song.url);
-        serverQueue.preloadedStream = null; // Limpiar precarga
+        serverQueue.preloadedStream = null;
         if (!streamURL) {
             serverQueue.textChannel.send('⚠️ Error al obtener el stream de la canción. Pasando a la siguiente...');
             serverQueue.songs.shift();
@@ -544,15 +628,14 @@ async function playSong(guildId, song) {
             inlineVolume: true,
             metadata: { title: song.title },
             inputType: 'opus',
-            silencePaddingFrames: 5
+            silencePaddingFrames: 5,
+            bufferingTimeout: 1000
         });
         resource.volume.setVolume(1.0);
 
-        // Pequeño retraso para asegurar que el stream anterior esté limpio
         await new Promise(resolve => setTimeout(resolve, 200));
 
         serverQueue.player.play(resource);
-        serverQueue.connection.subscribe(serverQueue.player);
 
         serverQueue.player.once(AudioPlayerStatus.Idle, () => {
             console.log(`Canción terminada: ${song.title}`);
@@ -561,7 +644,7 @@ async function playSong(guildId, song) {
         });
 
         serverQueue.player.on('error', (error) => {
-            console.error('Error en el reproductor:', error);
+            console.error(`Error en el reproductor: ${error.message}`);
             serverQueue.textChannel.send(`⚠️ Error de reproducción: ${error.message}. Pasando a la siguiente...`);
             serverQueue.songs.shift();
             playSong(guildId, serverQueue.songs[0]);
@@ -572,12 +655,16 @@ async function playSong(guildId, song) {
             preloadNextSong(guildId);
         }
     } catch (error) {
-        console.error('Error al reproducir la canción:', error);
+        console.error(`Error al reproducir la canción: ${error.message}`);
         serverQueue.textChannel.send('⚠️ Error al procesar la canción. Pasando a la siguiente...');
         serverQueue.songs.shift();
         playSong(guildId, serverQueue.songs[0]);
     }
 }
+
+client.on('error', (error) => {
+    console.error(`Error en la conexión de voz del cliente: ${error.message}`);
+});
 
 client.on('voiceStateUpdate', (oldState, newState) => {
     const serverQueue = queue.get(oldState.guild.id);
@@ -594,6 +681,6 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 client.login(TOKEN).catch((error) => {
-    console.error('❌ Error al iniciar sesión:', error);
+    console.error(`❌ Error al iniciar sesión: ${error.message}`);
     process.exit(1);
 });
