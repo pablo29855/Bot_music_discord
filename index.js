@@ -38,6 +38,19 @@ const spotifyApi = new SpotifyWebApi({
 // Cola de tareas
 const taskQueue = new Map();
 
+// Normalizar títulos para comparar similitud
+function normalizeTitle(title) {
+    return title.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+// Calcular similitud entre dos títulos
+function titleSimilarity(title1, title2) {
+    const words1 = normalizeTitle(title1).split(' ');
+    const words2 = normalizeTitle(title2).split(' ');
+    const commonWords = words1.filter(word => words2.includes(word));
+    return commonWords.length / Math.max(words1.length, words2.length);
+}
+
 function shuffleArray(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -48,11 +61,15 @@ function shuffleArray(array) {
 
 function removeDuplicates(songs) {
     const seen = new Set();
-    return songs.filter(song => {
-        if (seen.has(song.url)) return false;
-        seen.add(song.url);
-        return true;
-    });
+    const uniqueSongs = [];
+    for (const song of songs) {
+        const normalizedTitle = normalizeTitle(song.title);
+        if (!seen.has(song.url) && !uniqueSongs.some(s => titleSimilarity(normalizedTitle, normalizeTitle(s.title)) > 0.8)) {
+            seen.add(song.url);
+            uniqueSongs.push(song);
+        }
+    }
+    return uniqueSongs;
 }
 
 function cleanYouTubeURL(url) {
@@ -79,14 +96,24 @@ function getYouTubeIds(url) {
     }
 }
 
-async function getRelatedSongs(videoTitle, limit = 10) {
+async function getRelatedSongs(videoTitle, limit = 5) {
     try {
         const searchResults = await ytSearch(videoTitle);
         if (searchResults.videos.length) {
-            const songs = searchResults.videos.slice(0, Math.min(limit, MAX_PLAYLIST_ITEMS)).map(video => ({
-                title: video.title,
-                url: video.url
-            }));
+            const normalizedTargetTitle = normalizeTitle(videoTitle);
+            const songs = searchResults.videos
+                .filter(video => {
+                    const normalizedVideoTitle = normalizeTitle(video.title);
+                    return !normalizedVideoTitle.includes('cover') &&
+                           !normalizedVideoTitle.includes('remix') &&
+                           !normalizedVideoTitle.includes('live') &&
+                           titleSimilarity(normalizedVideoTitle, normalizedTargetTitle) < 0.8;
+                })
+                .slice(0, Math.min(limit, MAX_PLAYLIST_ITEMS))
+                .map(video => ({
+                    title: video.title,
+                    url: video.url
+                }));
             return removeDuplicates(shuffleArray(songs));
         }
         return [];
@@ -271,7 +298,7 @@ async function processSpotifyPlaylistTracks(guildId, tracks, textChannel, startI
         if (validSongs.length) {
             serverQueue.songs.push(...validSongs);
             if (i >= INITIAL_BATCH_SIZE && validSongs.length) {
-                textChannel.send(`🎵 Añadidas ${validSongs.length} canciones más a la cola desde la lista de Spotify.`);
+                textChannel.send(`🎉 **¡Más ritmo!** Se añadieron **${validSongs.length} canciones** a la cola desde tu lista de Spotify 🎧✨`);
             }
             if (serverQueue.songs.length <= 2) {
                 preloadNextSong(guildId);
@@ -343,18 +370,18 @@ client.on('interactionCreate', async (interaction) => {
 
         if (commandName === 'play') {
             if (!voiceChannel) {
-                return interaction.reply({ content: '¡Debes estar en un canal de voz para usar este comando!', ephemeral: true });
+                return interaction.reply({ content: '🎤 **¡Ups!** Necesitas estar en un canal de voz para rockear con este comando 😎', ephemeral: true });
             }
 
             const permissions = voiceChannel.permissionsFor(client.user);
             if (!permissions.has(PermissionsBitField.Flags.Connect) || !permissions.has(PermissionsBitField.Flags.Speak)) {
-                return interaction.reply({ content: 'No tengo permisos para unirme o hablar en tu canal de voz.', ephemeral: true });
+                return interaction.reply({ content: '🚫 **¡Oh no!** No tengo permisos para unirme o hablar en tu canal de voz 😢', ephemeral: true });
             }
 
             await interaction.deferReply();
             const songQuery = interaction.options.getString('cancion');
             if (!songQuery) {
-                return interaction.followUp({ content: 'Debes proporcionar el nombre, URL de una canción o URL de una lista de reproducción.', ephemeral: true });
+                return interaction.followUp({ content: '🔍 **¡Falta algo!** Escribe el nombre de una canción, una URL de YouTube o una lista de Spotify 🎶', ephemeral: true });
             }
 
             addTask(guild.id, async () => {
@@ -375,6 +402,7 @@ client.on('interactionCreate', async (interaction) => {
                                 throw new Error('No se encontraron resultados en YouTube para la canción de Spotify.');
                             }
                             songs = [song];
+                            await interaction.followUp(`🎵 **¡Listo para el show!** Reproduciendo: **${songs[0].title}** 🎤🔥`);
                         } else if (songQuery.includes('playlist/')) {
                             const playlistIdMatch = songQuery.match(/playlist\/([a-zA-Z0-9]+)/);
                             if (!playlistIdMatch) throw new Error('URL de lista de reproducción de Spotify inválida.');
@@ -403,36 +431,38 @@ client.on('interactionCreate', async (interaction) => {
                             if (tracks.length > INITIAL_BATCH_SIZE) {
                                 addTask(guild.id, () => processSpotifyPlaylistTracks(guild.id, tracks, channel, INITIAL_BATCH_SIZE));
                             }
+                            await interaction.followUp(`🎉 **¡Fiesta en marcha!** Reproduciendo **${songs.length} canciones** de tu lista de Spotify 🎧 ${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? '¡Más por venir! ✨' : ''}`);
                         } else {
                             throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
                         }
                     } else if (songQuery.includes('youtube.com') || songQuery.includes('youtu.be')) {
                         const { videoId, playlistId } = getYouTubeIds(songQuery);
                         if (playlistId && playlistId.startsWith('RD')) {
+                            // Ignorar listas dinámicas (RD) y reproducir solo la canción
                             if (!videoId) throw new Error('No se encontró un ID de video válido en la URL.');
                             const singleSongInfo = await getSongInfo(`https://www.youtube.com/watch?v=${videoId}`, false);
                             if (!singleSongInfo) {
                                 throw new Error('No se pudo obtener información del video inicial.');
                             }
                             songs = singleSongInfo;
-                            const relatedSongs = await getRelatedSongs(songs[0].title, 10);
-                            if (relatedSongs.length) {
-                                songs.push(...relatedSongs);
-                                await interaction.followUp(`⚠️ La lista dinámica de YouTube no es accesible directamente. Reproduciendo la canción inicial y añadiendo ${relatedSongs.length} canciones relacionadas.`);
-                            }
+                            await interaction.followUp(`🎵 **¡A darle caña!** Reproduciendo solo: **${songs[0].title}** 🎸🔥`);
                         } else if (playlistId) {
+                            // Procesar listas de reproducción estándar
                             const playlistURL = `https://www.youtube.com/playlist?list=${playlistId}`;
                             const songInfo = await getSongInfo(playlistURL, true);
                             if (!songInfo) {
                                 throw new Error('No se encontraron resultados para la lista de reproducción de YouTube.');
                             }
                             songs = songInfo;
+                            await interaction.followUp(`🎉 **¡Lista activada!** Reproduciendo **${songs.length} temazos** de tu lista de YouTube 📻✨`);
                         } else {
+                            // Solo una canción
                             const songInfo = await getSongInfo(songQuery, false);
                             if (!songInfo) {
                                 throw new Error('No se encontraron resultados para la URL de YouTube.');
                             }
                             songs = songInfo;
+                            await interaction.followUp(`🎵 **¡A rockear!** Reproduciendo: **${songs[0].title}** 🎤🔥`);
                         }
                     } else {
                         const song = await searchYouTube(songQuery);
@@ -440,10 +470,11 @@ client.on('interactionCreate', async (interaction) => {
                             throw new Error('No se encontraron resultados para tu búsqueda.');
                         }
                         songs = [song];
+                        await interaction.followUp(`🎵 **¡Toma ritmo!** Reproduciendo: **${songs[0].title}** 🎧✨`);
                     }
                 } catch (error) {
                     console.error(`Error al buscar la canción o lista de reproducción: ${error.message}`);
-                    await interaction.followUp({ content: error.message || 'Hubo un error al buscar la canción o lista de reproducción. Intenta con otra URL o búsqueda.', ephemeral: true });
+                    await interaction.followUp({ content: `😓 **¡Ups, algo salió mal!** ${error.message || 'No pude encontrar la canción o lista. Prueba con otra URL o búsqueda.'} 🔍`, ephemeral: true });
                     return;
                 }
 
@@ -453,7 +484,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
 
                 if (!songs.length) {
-                    await interaction.followUp({ content: 'No se añadieron canciones nuevas (posiblemente duplicadas o no disponibles).', ephemeral: true });
+                    await interaction.followUp({ content: '😢 **¡Vaya!** No se añadieron canciones nuevas, podrían estar duplicadas o no disponibles 😕', ephemeral: true });
                     return;
                 }
 
@@ -488,30 +519,31 @@ client.on('interactionCreate', async (interaction) => {
                             } catch {
                                 connection.destroy();
                                 queue.delete(guild.id);
-                                channel.send('⚠️ Desconectado del canal de voz. Usa /play para reconectar.');
+                                channel.send('😿 **¡Nos desconectaron!** Usa **/play** para volver al escenario 🎤');
                             }
                         });
 
                         connection.on('error', (error) => {
                             console.error(`Error en la conexión de voz: ${error.message}`);
-                            queueConstruct.textChannel.send('⚠️ Error en la conexión de voz. Por favor, intenta de nuevo.');
+                            queueConstruct.textChannel.send('😓 **¡Problema técnico!** Error en la conexión de voz. ¡Intenta de nuevo! 🔧');
                             queue.delete(guild.id);
                         });
 
                         await playSong(guild.id, queueConstruct.songs[0]);
-                        let message = `🎶 Reproduciendo: **${songs[0].title}**`;
+                        let message = `🎶 **¡Sonando ahora!** **${songs[0].title}** 🎸🔥`;
                         if (songs.length > 1 || isSpotifyPlaylist) {
-                            message += ` (+${songs.length - 1} canciones de la lista`;
+                            message += ` (+**${songs.length - 1} temazos** en la lista`;
                             if (isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE) {
-                                message += ', y más en procesamiento';
+                                message += ', ¡y más por llegar! 🚀)';
+                            } else {
+                                message += ' 🎉)';
                             }
-                            message += ')';
                         }
                         await interaction.followUp(message);
                     } catch (error) {
                         console.error(`Error al unirse al canal de voz: ${error.message}`);
                         queue.delete(guild.id);
-                        await interaction.followUp({ content: 'Hubo un error al unirme al canal de voz.', ephemeral: true });
+                        await interaction.followUp({ content: '😵 **¡Algo falló!** No pude unirme al canal de voz. ¡Revisa y prueba otra vez! 🔧', ephemeral: true });
                     }
                 } else {
                     serverQueue.songs.push(...songs);
@@ -524,33 +556,33 @@ client.on('interactionCreate', async (interaction) => {
                         clearTimeout(serverQueue.idleTimeout);
                         serverQueue.idleTimeout = null;
                     }
-                    let message = '🎵 ';
+                    let message = '🎵 **¡Más música en camino!** ';
                     if (songs.length > 1 || isSpotifyPlaylist) {
-                        message += `${songs.length} canciones añadidas a la cola`;
+                        message += `Se añadieron **${songs.length} temazos** a la cola 🎉`;
                         if (isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE) {
-                            message += ', procesando más en segundo plano.';
+                            message += ', ¡y más se están preparando en segundo plano! 🚀';
                         } else {
-                            message += '.';
+                            message += '!';
                         }
                     } else {
-                        message += `\`${songs[0].title}\` añadida a la cola.`;
+                        message += `**${songs[0].title}** añadido a la cola 🎧✨`;
                     }
                     await interaction.followUp(message);
                 }
             });
         } else if (commandName === 'skip') {
             if (!serverQueue) {
-                return interaction.reply({ content: 'No hay canciones en la cola para saltar.', ephemeral: true });
+                return interaction.reply({ content: '😕 **¡No hay nada que saltar!** La cola está vacía 📭', ephemeral: true });
             }
             serverQueue.player.stop(true);
             if (serverQueue.connection) {
                 serverQueue.connection.removeAllListeners('subscription');
                 serverQueue.connection.subscribe(serverQueue.player);
             }
-            await interaction.reply('⏩ Canción saltada.');
+            await interaction.reply('⏭️ **¡Zas!** Canción saltada, ¡vamos con la siguiente! 🚀🎶');
         } else if (commandName === 'stop') {
             if (!serverQueue) {
-                return interaction.reply({ content: 'No hay música en reproducción.', ephemeral: true });
+                return interaction.reply({ content: '😴 **¡Sin música en el escenario!** No hay nada que detener 🎧', ephemeral: true });
             }
             serverQueue.songs = [];
             serverQueue.player.stop(true);
@@ -563,33 +595,33 @@ client.on('interactionCreate', async (interaction) => {
             }
             queue.delete(guild.id);
             taskQueue.delete(guild.id);
-            await interaction.reply('⏹️ Música detenida y cola vaciada.');
+            await interaction.reply('⏹️ **¡Silencio en la sala!** La música se detuvo y la cola está vacía 😎👋');
         } else if (commandName === 'queue') {
             if (!serverQueue || !serverQueue.songs.length) {
-                return interaction.reply({ content: '📭 La cola está vacía.', ephemeral: true });
+                return interaction.reply({ content: '📭 **¡Cola vacía!** No hay canciones en la lista, ¡añade algo con /play! 🎵', ephemeral: true });
             }
 
-            let queueMessage = '**📜 Cola de canciones:**\n\n';
+            let queueMessage = '🎉 **¡Tu lista de reproducción!** 🎸\n\n';
             const maxDisplay = 10;
 
-            queueMessage += `🎵 **Ahora suena**: \`${serverQueue.songs[0].title}\`\n\n`;
+            queueMessage += `🎵 **Sonando ahora**: **${serverQueue.songs[0].title}** 🎤🔥\n\n`;
 
             if (serverQueue.songs.length > 1) {
-                queueMessage += '**Siguientes en la cola:**\n';
+                queueMessage += '**Próximos temazos:** 📜\n';
                 for (let i = 1; i < Math.min(serverQueue.songs.length, maxDisplay + 1); i++) {
-                    queueMessage += `${i}. \`${serverQueue.songs[i].title}\`\n`;
+                    queueMessage += `**${i}.** 🎧 ${serverQueue.songs[i].title}\n`;
                 }
                 if (serverQueue.songs.length > maxDisplay + 1) {
-                    queueMessage += `...y ${serverQueue.songs.length - maxDisplay - 1} canciones más.\n`;
+                    queueMessage += `...y **${serverQueue.songs.length - maxDisplay - 1} temazos más** en la cola! 🎉\n`;
                 }
             }
 
-            queueMessage += `\n**Total en la cola**: ${serverQueue.songs.length} canciones.`;
+            queueMessage += `\n**Total en la cola**: **${serverQueue.songs.length} canciones** 🎶✨`;
             await interaction.reply(queueMessage);
         }
     } catch (error) {
         console.error(`Error en la interacción: ${error.message}`);
-        await interaction.reply({ content: 'Ocurrió un error inesperado. Intenta de nuevo.', ephemeral: true }).catch(console.error);
+        await interaction.reply({ content: '😱 **¡Ay, ay, ay!** Algo salió mal, ¡intenta de nuevo por favor! 🔧', ephemeral: true }).catch(console.error);
     }
 });
 
@@ -604,7 +636,7 @@ async function playSong(guildId, song) {
             }
             queue.delete(guildId);
             taskQueue.delete(guildId);
-            serverQueue.textChannel.send('👋 Bot desconectado tras 30 minutos de inactividad.');
+            serverQueue.textChannel.send('😴 **¡Hora de descansar!** Me desconecté tras 30 minutos de silencio. ¡Vuelve a llamarme con /play! 👋🎶');
         }, IDLE_TIMEOUT);
         return;
     }
@@ -619,7 +651,7 @@ async function playSong(guildId, song) {
         const streamURL = serverQueue.preloadedStream && serverQueue.songs[0].url === song.url ? serverQueue.preloadedStream : await getStreamURL(song.url);
         serverQueue.preloadedStream = null;
         if (!streamURL) {
-            serverQueue.textChannel.send('⚠️ Error al obtener el stream de la canción. Pasando a la siguiente...');
+            serverQueue.textChannel.send('😓 **¡Ups!** No pude cargar esta canción, ¡vamos con la siguiente! ⏭️');
             serverQueue.songs.shift();
             return playSong(guildId, serverQueue.songs[0]);
         }
@@ -645,18 +677,18 @@ async function playSong(guildId, song) {
 
         serverQueue.player.on('error', (error) => {
             console.error(`Error en el reproductor: ${error.message}`);
-            serverQueue.textChannel.send(`⚠️ Error de reproducción: ${error.message}. Pasando a la siguiente...`);
+            serverQueue.textChannel.send(`😵 **¡Fallo en el escenario!** Error al reproducir: ${error.message}. ¡Pasamos a la siguiente! ⏭️`);
             serverQueue.songs.shift();
             playSong(guildId, serverQueue.songs[0]);
         });
 
-        serverQueue.textChannel.send(`🎶 Reproduciendo: **${song.title}**`);
+        serverQueue.textChannel.send(`🎶 **¡Sonando ahora!** **${song.title}** 🎸🔥`);
         if (serverQueue.songs.length <= 2) {
             preloadNextSong(guildId);
         }
     } catch (error) {
         console.error(`Error al reproducir la canción: ${error.message}`);
-        serverQueue.textChannel.send('⚠️ Error al procesar la canción. Pasando a la siguiente...');
+        serverQueue.textChannel.send('😓 **¡Algo falló!** No pude reproducir esta canción, ¡vamos con la siguiente! ⏭️');
         serverQueue.songs.shift();
         playSong(guildId, serverQueue.songs[0]);
     }
@@ -676,7 +708,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         }
         queue.delete(oldState.guild.id);
         taskQueue.delete(oldState.guild.id);
-        serverQueue.textChannel.send('👋 El bot fue desconectado del canal de voz.');
+        serverQueue.textChannel.send('😿 **¡Me echaron del escenario!** Desconectado del canal de voz. ¡Vuelve a llamarme con /play! 🎤👋');
     }
 });
 
