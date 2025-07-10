@@ -1,8 +1,8 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
 const ytSearch = require('yt-search');
+const ytdl = require('@distube/ytdl-core'); // Replaced yt-dlp with @distube/ytdl-core
 const SpotifyWebApi = require('spotify-web-api-node');
-const { spawn } = require('child_process');
 const NodeCache = require('node-cache');
 require('dotenv').config();
 
@@ -26,7 +26,6 @@ const INITIAL_BATCH_SIZE = 5;
 const MAX_PLAYLIST_ITEMS = 50;
 const CACHE_TTL_STREAM = 300; // 5 minutos para streams
 const CACHE_TTL_SEARCH = 24 * 3600;
-const YTDLP_TIMEOUT = 60 * 1000; // 60 segundos de timeout para yt-dlp
 
 const streamCache = new NodeCache({ stdTTL: CACHE_TTL_STREAM, checkperiod: 600, maxKeys: 1000 });
 const searchCache = new NodeCache({ stdTTL: CACHE_TTL_SEARCH, checkperiod: 600, maxKeys: 5000 });
@@ -121,41 +120,6 @@ async function getRelatedSongs(videoTitle, limit = 5) {
     }
 }
 
-function runYTDLP(args, url) {
-    return new Promise((resolve, reject) => {
-        const ytdlp = spawn('yt-dlp', [...args, url], { shell: false });
-        let output = '';
-        let errorOutput = '';
-
-        const timeout = setTimeout(() => {
-            ytdlp.kill();
-            reject(new Error('yt-dlp timeout después de 60 segundos'));
-        }, YTDLP_TIMEOUT);
-
-        ytdlp.stdout.on('data', (data) => {
-            output += data.toString();
-        });
-
-        ytdlp.stderr.on('data', (data) => {
-            errorOutput += data.toString();
-        });
-
-        ytdlp.on('close', (code) => {
-            clearTimeout(timeout);
-            if (code === 0) {
-                resolve(output.trim());
-            } else {
-                reject(new Error(`yt-dlp falló con código ${code}: ${errorOutput}`));
-            }
-        });
-
-        ytdlp.on('error', (error) => {
-            clearTimeout(timeout);
-            reject(new Error(`Error al ejecutar yt-dlp: ${error.message}`));
-        });
-    });
-}
-
 async function getStreamURL(url, retries = 0) {
     const cleanedURL = cleanYouTubeURL(url);
     const cacheKey = `stream:${cleanedURL}`;
@@ -175,24 +139,21 @@ async function getStreamURL(url, retries = 0) {
         }
     }
     try {
-        const streamURL = await runYTDLP([
-            '--no-warnings',
-            '-f', 'bestaudio[ext=opus]/bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=mp3]/bestaudio',
-            '--no-playlist',
-            '--get-url',
-            '--http-chunk-size', '10M',
-            '--retries', '3',
-            '--retry-sleep', '5'
-        ], cleanedURL);
-
-        const response = await fetch(streamURL, { method: 'HEAD', timeout: 5000 });
-        if (!response.ok) {
-            throw new Error(`Stream no accesible para ${cleanedURL}: ${response.statusText}`);
-        }
-
-        streamCache.set(cacheKey, streamURL);
-        console.log(`Stream URL obtenida para ${cleanedURL}: ${streamURL}`);
-        return streamURL;
+        // Use @distube/ytdl-core to get the stream URL
+        const stream = ytdl(cleanedURL, {
+            filter: 'audioonly',
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25, // 32MB buffer
+            requestOptions: {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+            }
+        });
+        // Since ytdl-core returns a stream directly, we store the URL for caching purposes
+        streamCache.set(cacheKey, cleanedURL);
+        console.log(`Stream URL obtenida para ${cleanedURL}`);
+        return stream; // Return the stream object directly for @discordjs/voice
     } catch (error) {
         console.error(`Error al obtener stream URL para ${cleanedURL}: ${error.message}`);
         return null;
@@ -206,36 +167,29 @@ async function getSongInfo(url, isPlaylist = false) {
         return streamCache.get(cacheKey);
     }
     try {
-        const args = isPlaylist
-            ? ['--no-warnings', '--dump-json', '--playlist-end', MAX_PLAYLIST_ITEMS.toString()]
-            : ['--no-warnings', '--no-playlist', '--dump-json'];
-
-        const output = await runYTDLP(args, cleanedURL);
-        const lines = output.split('\n').filter(line => line.trim());
-        const infos = lines.map(line => {
-            try {
-                return JSON.parse(line);
-            } catch (e) {
-                console.error(`Error al parsear JSON para ${cleanedURL}: ${e.message}`);
-                return null;
-            }
-        }).filter(info => info);
-
-        if (infos.length === 0) {
-            throw new Error('No se obtuvo información válida de yt-dlp');
-        }
-
-        let songs = infos.map(info => ({
-            title: info.title || 'Canción sin título',
-            url: info.webpage_url || `https://www.youtube.com/watch?v=${info.id}`
-        }));
-
         if (isPlaylist) {
+            // Use yt-search for playlists as ytdl-core has limited playlist support
+            const playlist = await ytSearch({ listId: getYouTubeIds(cleanedURL).playlistId });
+            if (!playlist.videos.length) {
+                throw new Error('No se encontraron videos en la lista de reproducción.');
+            }
+            let songs = playlist.videos.slice(0, MAX_PLAYLIST_ITEMS).map(video => ({
+                title: video.title,
+                url: video.url
+            }));
             songs = removeDuplicates(shuffleArray(songs));
+            streamCache.set(cacheKey, songs);
+            return songs;
+        } else {
+            // Use @distube/ytdl-core for single video info
+            const info = await ytdl.getInfo(cleanedURL);
+            const song = {
+                title: info.videoDetails.title || 'Canción sin título',
+                url: info.videoDetails.video_url || cleanedURL
+            };
+            streamCache.set(cacheKey, [song]);
+            return [song];
         }
-
-        streamCache.set(cacheKey, songs);
-        return songs;
     } catch (error) {
         console.error(`Error al obtener información para ${cleanedURL}: ${error.message}`);
         return null;
@@ -330,9 +284,9 @@ async function preloadNextSong(guildId) {
 
     const nextSong = serverQueue.songs[1];
     try {
-        const streamURL = await getStreamURL(nextSong.url);
-        if (streamURL) {
-            serverQueue.preloadedStream = streamURL;
+        const stream = await getStreamURL(nextSong.url);
+        if (stream) {
+            serverQueue.preloadedStream = stream;
         }
     } catch (error) {
         console.error(`Error al precargar stream para ${nextSong.url}: ${error.message}`);
@@ -446,7 +400,7 @@ client.on('interactionCreate', async (interaction) => {
                             }
 
                             if (tracks.length > INITIAL_BATCH_SIZE) {
-                                addTask(guild.id, () => processSpotifyPlaylistTracks(guild.id, tracks, channel, INITIAL_BATCH_SIZE));
+                                addTask(guid.id, () => processSpotifyPlaylistTracks(guild.id, tracks, channel, INITIAL_BATCH_SIZE));
                             }
                             await interaction.followUp(`🎉 **¡Fiesta en marcha!** Reproduciendo **${songs.length} canciones** de tu lista de Spotify 🎧 ${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? '¡Más por venir! ✨' : ''}`);
                         } else {
@@ -664,11 +618,10 @@ async function playSong(guildId, song, retryCount = 0) {
             serverQueue.connection.subscribe(serverQueue.player);
         }
 
-        const streamURL = serverQueue.preloadedStream && serverQueue.songs[0].url === song.url ? serverQueue.preloadedStream : await getStreamURL(song.url);
-        console.log(`Stream URL para ${song.title}: ${streamURL}`);
+        const stream = serverQueue.preloadedStream && serverQueue.songs[0].url === song.url ? serverQueue.preloadedStream : await getStreamURL(song.url);
         serverQueue.preloadedStream = null;
 
-        if (!streamURL) {
+        if (!stream) {
             if (retryCount >= maxRetries) {
                 serverQueue.textChannel.send(`😓 **¡Ups!** No pude cargar "${song.title}" tras ${maxRetries} intentos, ¡vamos con la siguiente! ⏭️`);
                 serverQueue.songs.shift();
@@ -686,7 +639,7 @@ async function playSong(guildId, song, retryCount = 0) {
             return playSong(guildId, serverQueue.songs[0], 0);
         }
 
-        const resource = createAudioResource(streamURL, {
+        const resource = createAudioResource(stream, {
             inlineVolume: true,
             metadata: { title: song.title },
             silencePaddingFrames: 20,
