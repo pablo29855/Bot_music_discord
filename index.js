@@ -4,6 +4,7 @@ const ytSearch = require('yt-search');
 const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const NodeCache = require('node-cache');
+const express = require('express');
 require('dotenv').config();
 
 // Usar fetch nativo o node-fetch como respaldo
@@ -24,7 +25,7 @@ const IDLE_TIMEOUT = 30 * 60 * 1000;
 const MAX_CONCURRENT_SEARCHES = 5;
 const INITIAL_BATCH_SIZE = 5;
 const MAX_PLAYLIST_ITEMS = 50;
-const CACHE_TTL_STREAM = 300; // 5 minutos para streams
+const CACHE_TTL_STREAM = 3600; // 1 hora para streams
 const CACHE_TTL_SEARCH = 24 * 3600;
 
 const streamCache = new NodeCache({ stdTTL: CACHE_TTL_STREAM, checkperiod: 600, maxKeys: 1000 });
@@ -139,25 +140,35 @@ async function getStreamURL(url, retries = 0) {
         }
     }
     try {
-        // Use @distube/ytdl-core to get the stream URL
-        const proxyUrl = process.env.PROXY_URL; // Leer la URL del proxy desde las variables de entorno
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+        ];
+        const randomUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+
         const stream = ytdl(cleanedURL, {
             filter: 'audioonly',
             quality: 'highestaudio',
-            highWaterMark: 1 << 25, // 32MB buffer
+            highWaterMark: 1 << 25,
             requestOptions: {
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                },
-                ...(proxyUrl && { proxy: proxyUrl }) // Añadir proxy si está configurado
+                    'User-Agent': randomUserAgent
+                }
             }
         });
-        // Since ytdl-core returns a stream directly, we store the URL for caching purposes
         streamCache.set(cacheKey, cleanedURL);
         console.log(`Stream URL obtenida para ${cleanedURL}`);
-        return stream; // Return the stream object directly for @discordjs/voice
+        return stream;
     } catch (error) {
         console.error(`Error al obtener stream URL para ${cleanedURL}: ${error.message}`);
+        if (error.statusCode === 429 && retries < 3) {
+            const delay = Math.pow(2, retries) * 10000; // Backoff: 10s, 20s, 40s
+            console.log(`Rate limit alcanzado, esperando ${delay / 1000} segundos antes de reintentar...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return getStreamURL(url, retries + 1);
+        }
         return null;
     }
 }
@@ -170,7 +181,6 @@ async function getSongInfo(url, isPlaylist = false) {
     }
     try {
         if (isPlaylist) {
-            // Use yt-search for playlists as ytdl-core has limited playlist support
             const playlist = await ytSearch({ listId: getYouTubeIds(cleanedURL).playlistId });
             if (!playlist.videos.length) {
                 throw new Error('No se encontraron videos en la lista de reproducción.');
@@ -183,16 +193,7 @@ async function getSongInfo(url, isPlaylist = false) {
             streamCache.set(cacheKey, songs);
             return songs;
         } else {
-            // Use @distube/ytdl-core for single video info
-            const proxyUrl = process.env.PROXY_URL; // Leer la URL del proxy desde las variables de entorno
-            const info = await ytdl.getInfo(cleanedURL, {
-                requestOptions: {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                    },
-                    ...(proxyUrl && { proxy: proxyUrl }) // Añadir proxy si está configurado
-                }
-            });
+            const info = await ytdl.getInfo(cleanedURL);
             const song = {
                 title: info.videoDetails.title || 'Canción sin título',
                 url: info.videoDetails.video_url || cleanedURL
@@ -248,7 +249,18 @@ async function searchYouTube(query) {
         return searchCache.get(cacheKey);
     }
     try {
-        const searchResults = await ytSearch(query);
+        const userAgents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+        ];
+        const randomUserAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+        const searchResults = await ytSearch(query, {
+            headers: {
+                'User-Agent': randomUserAgent
+            }
+        });
         if (searchResults.videos.length) {
             const song = { title: searchResults.videos[0].title, url: searchResults.videos[0].url };
             searchCache.set(cacheKey, song);
@@ -285,6 +297,7 @@ async function processSpotifyPlaylistTracks(guildId, tracks, textChannel, startI
                 preloadNextSong(guildId);
             }
         }
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1-second delay between batches
     }
 }
 
@@ -330,7 +343,7 @@ async function processNextTask(guildId) {
             taskQueue.delete(guildId);
         }
     }
-}
+ Pins}
 
 client.once('ready', async () => {
     console.log(`✅ Bot conectado como ${client.user.tag}`);
@@ -338,6 +351,10 @@ client.once('ready', async () => {
     if (!tokenSuccess) {
         console.error(`No se pudo iniciar la integración con Spotify. El bot seguirá funcionando para YouTube.`);
     }
+    // Iniciar el servidor de health check
+    const app = express();
+    app.get('/health', (req, res) => res.status(200).send('OK'));
+    app.listen(process.env.PORT || 3000, () => console.log('Health check server running'));
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -416,7 +433,7 @@ client.on('interactionCreate', async (interaction) => {
                         } else {
                             throw new Error('URL de Spotify no reconocida. Usa una URL de canción o lista de reproducción.');
                         }
-                    } else if (songQuery.includes('youtube.com') || songQuery.includes('youtu.be')) {
+                    } else if (songQuery.includes('youtube.com') || songQuery.includes('you.tu.be')) {
                         const { videoId, playlistId } = getYouTubeIds(songQuery);
                         if (playlistId && playlistId.startsWith('RD')) {
                             if (!videoId) throw new Error('No se encontró un ID de video válido en la URL.');
