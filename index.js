@@ -1,7 +1,7 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
 const ytSearch = require('yt-search');
-const ytdl = require('@distube/ytdl-core'); // Replaced yt-dlp with @distube/ytdl-core
+const ytdl = require('@distube/ytdl-core');
 const SpotifyWebApi = require('spotify-web-api-node');
 const NodeCache = require('node-cache');
 require('dotenv').config();
@@ -140,6 +140,7 @@ async function getStreamURL(url, retries = 0) {
     }
     try {
         // Use @distube/ytdl-core to get the stream URL
+        const proxyUrl = process.env.PROXY_URL; // Leer la URL del proxy desde las variables de entorno
         const stream = ytdl(cleanedURL, {
             filter: 'audioonly',
             quality: 'highestaudio',
@@ -147,7 +148,8 @@ async function getStreamURL(url, retries = 0) {
             requestOptions: {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }
+                },
+                ...(proxyUrl && { proxy: proxyUrl }) // Añadir proxy si está configurado
             }
         });
         // Since ytdl-core returns a stream directly, we store the URL for caching purposes
@@ -182,7 +184,15 @@ async function getSongInfo(url, isPlaylist = false) {
             return songs;
         } else {
             // Use @distube/ytdl-core for single video info
-            const info = await ytdl.getInfo(cleanedURL);
+            const proxyUrl = process.env.PROXY_URL; // Leer la URL del proxy desde las variables de entorno
+            const info = await ytdl.getInfo(cleanedURL, {
+                requestOptions: {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    },
+                    ...(proxyUrl && { proxy: proxyUrl }) // Añadir proxy si está configurado
+                }
+            });
             const song = {
                 title: info.videoDetails.title || 'Canción sin título',
                 url: info.videoDetails.video_url || cleanedURL
@@ -400,7 +410,7 @@ client.on('interactionCreate', async (interaction) => {
                             }
 
                             if (tracks.length > INITIAL_BATCH_SIZE) {
-                                addTask(guid.id, () => processSpotifyPlaylistTracks(guild.id, tracks, channel, INITIAL_BATCH_SIZE));
+                                addTask(guild.id, () => processSpotifyPlaylistTracks(guild.id, tracks, channel, INITIAL_BATCH_SIZE));
                             }
                             await interaction.followUp(`🎉 **¡Fiesta en marcha!** Reproduciendo **${songs.length} canciones** de tu lista de Spotify 🎧 ${isSpotifyPlaylist && totalTracks > INITIAL_BATCH_SIZE ? '¡Más por venir! ✨' : ''}`);
                         } else {
