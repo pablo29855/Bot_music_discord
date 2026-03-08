@@ -1,8 +1,9 @@
 const { Client, GatewayIntentBits, PermissionsBitField } = require('discord.js');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
-const youtubedl = require('youtube-dl-exec'); // Nueva librería
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, StreamType } = require('@discordjs/voice');
+const youtubedl = require('youtube-dl-exec');
 const SpotifyWebApi = require('spotify-web-api-node');
 const NodeCache = require('node-cache');
+const { spawn } = require('child_process');
 require('dotenv').config();
 
 const fetch = globalThis.fetch || require('node-fetch').default;
@@ -92,7 +93,6 @@ function getYouTubeIds(url) {
     }
 }
 
-// MIGRADO: Buscar canciones relacionadas usando yt-dlp
 async function getRelatedSongs(videoTitle, limit = 5) {
     try {
         const searchResults = await youtubedl(`ytsearch${Math.min(limit * 2, MAX_PLAYLIST_ITEMS)}:${videoTitle}`, {
@@ -128,12 +128,36 @@ async function getRelatedSongs(videoTitle, limit = 5) {
     }
 }
 
-// MIGRADO: Obtener stream URL usando yt-dlp
+// NUEVO: Crear stream de audio usando FFmpeg con reconexión
+function createFFmpegStream(url) {
+    const ffmpegArgs = [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', url,
+        '-analyzeduration', '0',
+        '-loglevel', '0',
+        '-ar', '48000',
+        '-ac', '2',
+        '-f', 's16le',
+        'pipe:1'
+    ];
+
+    const ffmpegProcess = spawn('ffmpeg', ffmpegArgs, {
+        stdio: ['ignore', 'pipe', 'ignore']
+    });
+
+    ffmpegProcess.on('error', (error) => {
+        console.error(`Error en FFmpeg: ${error.message}`);
+    });
+
+    return ffmpegProcess;
+}
+
 async function getStreamURL(url) {
     const cleanedURL = cleanYouTubeURL(url);
     
     try {
-        // Obtener la mejor URL de audio directamente
         const info = await youtubedl(cleanedURL, {
             dumpSingleJson: true,
             noWarnings: true,
@@ -141,18 +165,20 @@ async function getStreamURL(url) {
             noCheckCertificate: true,
             preferFreeFormats: true,
             youtubeSkipDashManifest: true,
-            format: 'bestaudio/best'
+            format: 'bestaudio[ext=webm]/bestaudio/best',
+            noPlaylist: true
         });
         
-        // yt-dlp devuelve la URL directa del stream en info.url
         if (info.url) {
             console.log(`Stream URL obtenida para ${cleanedURL}`);
             return info.url;
         }
         
-        // Alternativa: buscar en los formatos disponibles
         if (info.formats && info.formats.length) {
-            const audioFormat = info.formats.find(f => f.acodec !== 'none' && f.vcodec === 'none') || info.formats[0];
+            const audioFormat = info.formats
+                .filter(f => f.acodec !== 'none')
+                .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0];
+            
             if (audioFormat && audioFormat.url) {
                 console.log(`Stream URL alternativa obtenida para ${cleanedURL}`);
                 return audioFormat.url;
@@ -166,7 +192,6 @@ async function getStreamURL(url) {
     }
 }
 
-// MIGRADO: Obtener información de canciones usando yt-dlp
 async function getSongInfo(url, isPlaylist = false) {
     const cleanedURL = isPlaylist ? url : cleanYouTubeURL(url);
     
@@ -252,7 +277,6 @@ async function getAllPlaylistTracks(playlistId) {
     }
 }
 
-// MIGRADO: Buscar en YouTube usando yt-dlp
 async function searchYouTube(query) {
     const cacheKey = `search:${query}`;
     
@@ -338,6 +362,58 @@ async function processNextTask(guildId) {
     }
 }
 
+// NUEVO: Configurar event listeners del player UNA sola vez
+function setupPlayerListeners(guildId, player) {
+    player.removeAllListeners(AudioPlayerStatus.Idle);
+    player.removeAllListeners('error');
+    
+    player.on(AudioPlayerStatus.Idle, () => {
+        const serverQueue = queue.get(guildId);
+        if (!serverQueue) return;
+        
+        if (serverQueue.currentFFmpeg) {
+            serverQueue.currentFFmpeg.kill('SIGKILL');
+            serverQueue.currentFFmpeg = null;
+        }
+        
+        console.log(`Canción terminada en guild ${guildId}`);
+        serverQueue.songs.shift();
+        
+        if (serverQueue.songs.length > 0) {
+            playSong(guildId, serverQueue.songs[0], 0);
+        } else {
+            serverQueue.idleTimeout = setTimeout(() => {
+                if (serverQueue.connection && serverQueue.connection.state.status !== 'destroyed') {
+                    serverQueue.connection.destroy();
+                }
+                queue.delete(guildId);
+                taskQueue.delete(guildId);
+                serverQueue.textChannel.send('😴 **¡Hora de descansar!** Me desconecté tras 30 minutos de silencio. ¡Vuelve a llamarme con /play! 👋🎶');
+            }, IDLE_TIMEOUT);
+        }
+    });
+    
+    player.on('error', (error) => {
+        const serverQueue = queue.get(guildId);
+        if (!serverQueue) return;
+        
+        console.error(`Error en el reproductor para guild ${guildId}: ${error.message}`);
+        
+        if (serverQueue.currentFFmpeg) {
+            serverQueue.currentFFmpeg.kill('SIGKILL');
+            serverQueue.currentFFmpeg = null;
+        }
+        
+        const currentSong = serverQueue.songs[0];
+        serverQueue.textChannel.send(`😵 **¡Fallo en el escenario!** Error al reproducir ${currentSong?.title || 'canción'}: ${error.message}. ¡Pasamos a la siguiente! ⏭️`);
+        serverQueue.songs.shift();
+        
+        if (serverQueue.songs.length > 0) {
+            playSong(guildId, serverQueue.songs[0], 0);
+        }
+    });
+}
+
 client.once('ready', async () => {
     console.log(`✅ Bot conectado como ${client.user.tag}`);
     const tokenSuccess = await getSpotifyToken();
@@ -352,7 +428,6 @@ client.on('interactionCreate', async (interaction) => {
     try {
         const { commandName, guild, member, channel } = interaction;
         const voiceChannel = member?.voice?.channel;
-
         const serverQueue = queue.get(guild.id);
 
         if (commandName === 'play') {
@@ -473,16 +548,23 @@ client.on('interactionCreate', async (interaction) => {
                 }
 
                 if (!serverQueue) {
+                    const player = createAudioPlayer({ behaviors: { noSubscriber: 'pause' } });
+                    
                     const queueConstruct = {
                         textChannel: channel,
                         voiceChannel: voiceChannel,
                         connection: null,
                         songs: [],
-                        player: createAudioPlayer({ behaviors: { noSubscriber: 'pause' } }),
-                        idleTimeout: null
+                        player: player,
+                        idleTimeout: null,
+                        currentFFmpeg: null
                     };
+                    
                     queue.set(guild.id, queueConstruct);
                     queueConstruct.songs.push(...songs);
+                    
+                    // Configurar listeners UNA sola vez
+                    setupPlayerListeners(guild.id, player);
 
                     try {
                         const connection = joinVoiceChannel({
@@ -491,6 +573,7 @@ client.on('interactionCreate', async (interaction) => {
                             adapterCreator: guild.voiceAdapterCreator,
                         });
                         queueConstruct.connection = connection;
+                        connection.subscribe(player);
 
                         connection.on(VoiceConnectionStatus.Disconnected, async () => {
                             try {
@@ -555,16 +638,24 @@ client.on('interactionCreate', async (interaction) => {
             if (!serverQueue) {
                 return interaction.reply({ content: '😕 **¡No hay nada que saltar!** La cola está vacía 📭', ephemeral: true });
             }
-            serverQueue.player.stop(true);
-            if (serverQueue.connection) {
-                serverQueue.connection.removeAllListeners('subscription');
-                serverQueue.connection.subscribe(serverQueue.player);
+            
+            if (serverQueue.currentFFmpeg) {
+                serverQueue.currentFFmpeg.kill('SIGKILL');
+                serverQueue.currentFFmpeg = null;
             }
+            
+            serverQueue.player.stop(true);
             await interaction.reply('⏭️ **¡Zas!** Canción saltada, ¡vamos con la siguiente! 🚀🎶');
         } else if (commandName === 'stop') {
             if (!serverQueue) {
                 return interaction.reply({ content: '😴 **¡Sin música en el escenario!** No hay nada que detener 🎧', ephemeral: true });
             }
+            
+            if (serverQueue.currentFFmpeg) {
+                serverQueue.currentFFmpeg.kill('SIGKILL');
+                serverQueue.currentFFmpeg = null;
+            }
+            
             serverQueue.songs = [];
             serverQueue.player.stop(true);
             if (serverQueue.connection && serverQueue.connection.state.status !== 'destroyed') {
@@ -606,10 +697,15 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-// CORREGIDO: Función playSong usando yt-dlp
+// CORREGIDO: Función playSong usando FFmpeg con reconexión
 async function playSong(guildId, song, retryCount = 0) {
     const serverQueue = queue.get(guildId);
     if (!serverQueue) return;
+
+    if (serverQueue.idleTimeout) {
+        clearTimeout(serverQueue.idleTimeout);
+        serverQueue.idleTimeout = null;
+    }
 
     if (!song) {
         serverQueue.idleTimeout = setTimeout(() => {
@@ -624,24 +720,24 @@ async function playSong(guildId, song, retryCount = 0) {
     }
 
     const maxRetries = 2;
+    
     try {
         console.log(`Intentando reproducir: ${song.title} (${song.url})`);
-        serverQueue.player.stop(true);
-        if (serverQueue.connection) {
-            serverQueue.connection.removeAllListeners('subscription');
-            serverQueue.connection.subscribe(serverQueue.player);
+        
+        if (serverQueue.currentFFmpeg) {
+            serverQueue.currentFFmpeg.kill('SIGKILL');
+            serverQueue.currentFFmpeg = null;
         }
 
-        // Obtener URL del stream con yt-dlp
         const streamUrl = await getStreamURL(song.url);
 
         if (!streamUrl) {
             if (retryCount >= maxRetries) {
-                serverQueue.textChannel.send(`😓 **¡Ups!** No pude cargar "${song.title}" tras ${maxRetries} intentos, ¡vamos con la siguiente! ⏭️`);
+                serverQueue.textChannel.send(`😓 **¡Ups!** No pude cargar "${song.title}" tras ${maxRetries + 1} intentos, ¡vamos con la siguiente! ⏭️`);
                 serverQueue.songs.shift();
                 return playSong(guildId, serverQueue.songs[0], 0);
             }
-            console.warn(`No se pudo obtener stream para ${song.title} (${song.url}), intentando con búsqueda alternativa (intento ${retryCount + 1})`);
+            console.warn(`No se pudo obtener stream para ${song.title}, intentando búsqueda alternativa (intento ${retryCount + 1})`);
             const alternativeSong = await searchYouTube(`${song.title} audio`);
             if (alternativeSong && alternativeSong.url !== song.url) {
                 console.log(`Encontrada alternativa: ${alternativeSong.title} (${alternativeSong.url})`);
@@ -653,32 +749,37 @@ async function playSong(guildId, song, retryCount = 0) {
             return playSong(guildId, serverQueue.songs[0], 0);
         }
 
-        // Crear recurso de audio desde la URL del stream
-        const resource = createAudioResource(streamUrl, {
-            inlineVolume: true,
-            metadata: { title: song.title }
+        // Crear proceso FFmpeg con opciones de reconexión
+        const ffmpegProcess = createFFmpegStream(streamUrl);
+        serverQueue.currentFFmpeg = ffmpegProcess;
+        
+        ffmpegProcess.on('close', (code) => {
+            if (code !== 0 && code !== null) {
+                console.log(`FFmpeg cerrado con código ${code} para ${song.title}`);
+            }
         });
-        resource.volume.setVolume(1.0);
 
-        await new Promise(resolve => setTimeout(resolve, 200));
+        const resource = createAudioResource(ffmpegProcess.stdout, {
+            inputType: StreamType.Raw,
+            inlineVolume: true
+        });
+        
+        resource.volume?.setVolume(1.0);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
         serverQueue.player.play(resource);
 
-        serverQueue.player.once(AudioPlayerStatus.Idle, () => {
-            console.log(`Canción terminada: ${song.title}`);
-            serverQueue.songs.shift();
-            playSong(guildId, serverQueue.songs[0], 0);
-        });
-
-        serverQueue.player.on('error', (error) => {
-            console.error(`Error en el reproductor para ${song.title} (${song.url}): ${error.message}`);
-            serverQueue.textChannel.send(`😵 **¡Fallo en el escenario!** Error al reproducir ${song.title}: ${error.message}. ¡Pasamos a la siguiente! ⏭️`);
-            serverQueue.songs.shift();
-            playSong(guildId, serverQueue.songs[0], 0);
-        });
-
         serverQueue.textChannel.send(`🎶 **¡Sonando ahora!** **${song.title}** 🎸🔥`);
+        
     } catch (error) {
         console.error(`Error al reproducir la canción ${song.title}: ${error.message}`);
+        
+        if (retryCount < maxRetries) {
+            console.log(`Reintentando reproducir ${song.title} (intento ${retryCount + 1})`);
+            return playSong(guildId, song, retryCount + 1);
+        }
+        
         serverQueue.textChannel.send(`😓 **¡Algo falló!** No pude reproducir ${song.title}, ¡vamos con la siguiente! ⏭️`);
         serverQueue.songs.shift();
         playSong(guildId, serverQueue.songs[0], 0);
@@ -694,6 +795,11 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     if (!serverQueue) return;
 
     if (oldState.channelId && !newState.channelId && newState.id === client.user.id) {
+        if (serverQueue.currentFFmpeg) {
+            serverQueue.currentFFmpeg.kill('SIGKILL');
+            serverQueue.currentFFmpeg = null;
+        }
+        
         if (serverQueue.idleTimeout) {
             clearTimeout(serverQueue.idleTimeout);
         }
