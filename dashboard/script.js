@@ -146,3 +146,76 @@ function updateDashboard(data) {
 // Polling cada 3 segundos
 setInterval(fetchStatus, 3000);
 fetchStatus();
+
+// --- Lógica del Sistema ---
+const logsModal = document.getElementById('logsModal');
+const btnLogs = document.getElementById('btnLogs');
+const btnCloseLogs = document.getElementById('btnCloseLogs');
+const logsContainer = document.getElementById('logsContainer');
+let logsInterval = null;
+
+btnLogs.addEventListener('click', () => {
+    logsModal.classList.add('active');
+    fetchLogs();
+    logsInterval = setInterval(fetchLogs, 2000);
+});
+
+btnCloseLogs.addEventListener('click', () => {
+    logsModal.classList.remove('active');
+    clearInterval(logsInterval);
+});
+
+// Cerrar clickeando fuera del modal
+logsModal.addEventListener('click', (e) => {
+    if (e.target === logsModal) {
+        logsModal.classList.remove('active');
+        clearInterval(logsInterval);
+    }
+});
+
+async function fetchLogs() {
+    try {
+        const res = await fetch('http://localhost:3000/api/logs');
+        if (!res.ok) throw new Error('Cargando...');
+        const logs = await res.json();
+        
+        logsContainer.innerHTML = '';
+        if (logs.length === 0) {
+            logsContainer.innerHTML = '<div class="log-line">No hay logs recientes...</div>';
+            return;
+        }
+
+        logs.forEach(log => {
+            const isError = log.includes('[ERROR]');
+            const div = document.createElement('div');
+            div.className = `log-line ${isError ? 'log-error' : 'log-info'}`;
+            
+            // Format Timestamp
+            const logParts = log.match(/^(\[\d{2}:\d{2}:\d{2}\])(.*)/);
+            if (logParts) {
+                div.innerHTML = `<span class="log-timestamp">${logParts[1]}</span>${logParts[2]}`;
+            } else {
+                div.innerText = log;
+            }
+            logsContainer.appendChild(div);
+        });
+
+        // AutoScroll to bottom
+        logsContainer.scrollTop = logsContainer.scrollHeight;
+
+    } catch (err) {
+        logsContainer.innerHTML = `<div class="log-line log-error">Error al conectar con la consola del Bot.</div>`;
+    }
+}
+
+document.getElementById('btnShutdown').addEventListener('click', async () => {
+    if(confirm("¿Estás seguro de que deseas apagar el bot por completo? (Tendrás que encenderlo manualmente desde Start_Bot.bat)")) {
+        try {
+            await fetch('http://localhost:3000/api/shutdown', { method: 'POST' });
+            alert("El bot se ha apagado. Puedes cerrar esta ventana.");
+            window.close(); // Intenta cerrar la pestaña
+        } catch(e) {
+            alert("Error enviando orden de apagado.");
+        }
+    }
+});

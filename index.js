@@ -10,12 +10,31 @@ const {
 } = require('@discordjs/voice');
 
 const youtubedl = require('youtube-dl-exec');
-const SpotifyWebApi = require('spotify-web-api-node');
+const { getTracks, getPreview } = require('spotify-url-info')(fetch);
 const NodeCache = require('node-cache');
 const { spawn } = require('child_process');
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
+
+const globalLogs = [];
+const logLimit = 100;
+function addLog(type, args) {
+    const message = args.map(a => {
+        if (a instanceof Error) return a.stack || a.message;
+        return typeof a === 'object' ? JSON.stringify(a) : String(a);
+    }).join(' ');
+    const timestamp = new Date().toLocaleTimeString('es-ES', { hour12: false });
+    globalLogs.push(`[${timestamp}] [${type}] ${message}`);
+    if (globalLogs.length > logLimit) globalLogs.shift();
+}
+
+const originalLog = console.log;
+const originalError = console.error;
+
+console.log = function(...args) { addLog('INFO', args); originalLog.apply(console, args); };
+console.error = function(...args) { addLog('ERROR', args); originalError.apply(console, args); };
 
 const client = new Client({
     intents: [
@@ -36,14 +55,9 @@ const searchCache = new NodeCache({
     checkperiod: 600
 });
 
-const spotifyApi = new SpotifyWebApi({
-    clientId: process.env.SPOTIFY_CLIENT_ID,
-    clientSecret: process.env.SPOTIFY_CLIENT_SECRET
-});
-
+// Spotify API official token is no longer used due to 2026 Developer Policy changes blocking Playlist reads for App Tokens.
 async function initSpotify() {
-    const data = await spotifyApi.clientCredentialsGrant();
-    spotifyApi.setAccessToken(data.body['access_token']);
+    console.log("INFO: Spotify Web API Node descartado en favor de Scanner (spotify-url-info) debido a bloqueos 403 de Spotify.");
 }
 
 function isYouTubeURL(url) {
@@ -128,23 +142,28 @@ async function searchYouTube(query) {
 
 async function getSpotifyTracks(url) {
     const tracks = [];
-
-    if (url.includes('/track/')) {
-        const id = url.split('/track/')[1].split('?')[0];
-        const track = await spotifyApi.getTrack(id);
-        tracks.push(`${track.body.name} ${track.body.artists[0].name}`);
-    }
-
-    if (url.includes('/playlist/')) {
-        const id = url.split('/playlist/')[1].split('?')[0];
-        const data = await spotifyApi.getPlaylistTracks(id);
-
-        for (const item of data.body.items) {
-            const t = item.track;
-            tracks.push(`${t.name} ${t.artists[0].name}`);
+    try {
+        // Obtenemos los tracks mediante scraping web nativo gracias a spotify-url-info
+        // (Esto saltea por completo el Error 403 Forbidden de las APIs Oficiales).
+        const spTracks = await getTracks(url);
+        
+        for (const t of spTracks) {
+            if (!t) break;
+            const titleStr = t.name ? t.name : '';
+            const artistStr = (t.artists && t.artists[0]) ? t.artists[0].name : '';
+            
+            tracks.push({
+                title: `${titleStr} - ${artistStr}`,
+                query: `${titleStr} ${artistStr}`,
+                url: t.external_urls?.spotify || url,
+                isLazy: true
+            });
         }
+    } catch (e) {
+        console.error("Scanner fallback failed:", e.message);
+        throw e;
     }
-
+    
     return tracks;
 }
 
@@ -171,35 +190,50 @@ function setupPlayer(guildId, player) {
 }
 
 async function playSong(guildId, song) {
-    const serverQueue = queue.get(guildId);
-    if (!serverQueue || !song) return;
+    try {
+        const serverQueue = queue.get(guildId);
+        if (!serverQueue || !song) return;
 
-    if (serverQueue.currentFFmpeg) {
-        serverQueue.currentFFmpeg.kill('SIGKILL');
-        serverQueue.currentFFmpeg = null;
+        if (serverQueue.currentFFmpeg) {
+            serverQueue.currentFFmpeg.kill('SIGKILL');
+            serverQueue.currentFFmpeg = null;
+        }
+
+        let streamUrl = null;
+
+        if (song.isLazy) {
+            const ytSong = await searchYouTube(song.query);
+            if (ytSong) {
+                streamUrl = await getStreamURL(ytSong.url);
+                song.url = ytSong.url; // Refresh to Youtube URL
+                song.isLazy = false;
+            }
+        } else {
+            streamUrl = await getStreamURL(song.url);
+        }
+
+        if (!streamUrl) {
+            console.log(`WARN: No se pudo obtener stream para ${song.title}. Saltando...`);
+            serverQueue.songs.shift();
+            return playSong(guildId, serverQueue.songs[0]);
+        }
+
+        const ffmpeg = createFFmpegStream(streamUrl);
+        serverQueue.currentFFmpeg = ffmpeg;
+
+        const resource = createAudioResource(ffmpeg.stdout, {
+            inputType: StreamType.Raw,
+            inlineVolume: true
+        });
+
+        resource.volume.setVolumeLogarithmic(1.0);
+        serverQueue.player.play(resource);
+    } catch (err) {
+        console.error("CRITICAL error en playSong:", err.message);
     }
-
-    const streamUrl = await getStreamURL(song.url);
-
-    if (!streamUrl) {
-        serverQueue.songs.shift();
-        return playSong(guildId, serverQueue.songs[0]);
-    }
-
-    const ffmpeg = createFFmpegStream(streamUrl);
-    serverQueue.currentFFmpeg = ffmpeg;
-
-    const resource = createAudioResource(ffmpeg.stdout, {
-        inputType: StreamType.Raw,
-        inlineVolume: true
-    });
-
-    resource.volume.setVolumeLogarithmic(1.0);
-
-    serverQueue.player.play(resource);
 }
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
     await initSpotify();
     console.log(`✅ Bot conectado como ${client.user.tag}`);
 });
@@ -231,10 +265,14 @@ client.on('interactionCreate', async interaction => {
                 songsToAdd.push({ title: 'Youtube Link', url: query });
             }
         } else if (isSpotifyURL(query)) {
-            const tracks = await getSpotifyTracks(query);
-            for (const t of tracks) {
-                const song = await searchYouTube(t);
-                if (song) songsToAdd.push(song);
+            try {
+                const tracks = await getSpotifyTracks(query);
+                for (const t of tracks) {
+                    songsToAdd.push(t);
+                }
+            } catch (err) {
+                console.error("Error obteniendo Spotify (probablemente una lista Privada o Token vencido):", err.message);
+                return interaction.followUp("❌ No pudimos acceder a este enlace de Spotify. ¿Es posible que la Playlist sea privada?");
             }
         } else {
             const song = await searchYouTube(query);
@@ -292,7 +330,7 @@ client.on('interactionCreate', async interaction => {
                 playSong(guild.id, serverQueue.songs[0]);
             }
 
-            interaction.followUp(`➕ Añadido ${songsToAdd.length} canción(es) a la cola`);
+            interaction.followUp(`➕ Añadido ${songsToAdd.length} canción(es) a la cola. ${songsToAdd.length === 100 ? '(Nota: Spotify restringe nuevas apps a 100 max)' : ''}`);
         }
     }
 
@@ -317,30 +355,36 @@ client.on('interactionCreate', async interaction => {
 // --- API DASHBOARD ---
 const app = express();
 app.use(cors());
+app.use(express.static(path.join(__dirname, 'dashboard')));
 
 app.get('/api/status', (req, res) => {
-    const activeStreams = Array.from(queue.keys()).map(guildId => {
-        const q = queue.get(guildId);
-        const guild = client.guilds.cache.get(guildId);
-        return {
-            guildId: guildId,
-            guildName: guild ? guild.name : 'Unknown Server',
-            currentSong: q.songs[0] ? q.songs[0].title : null,
-            songUrl: q.songs[0] ? q.songs[0].url : null,
-            queueLength: q.songs.length > 0 ? q.songs.length - 1 : 0,
-            voiceChannel: q.voiceChannel ? q.voiceChannel.name : 'Unknown Channel',
-            isPaused: q.player ? q.player.state.status === AudioPlayerStatus.Paused : false,
-            nextSongs: q.songs.slice(1, 4).map(s => s.title) // Hasta 3 canciones siguientes
-        };
-    });
+    try {
+        const activeStreams = Array.from(queue.keys()).map(guildId => {
+            const q = queue.get(guildId);
+            const guild = client.guilds.cache.get(guildId);
+            return {
+                guildId: guildId,
+                guildName: guild ? guild.name : 'Unknown Server',
+                currentSong: q.songs[0] ? q.songs[0].title : null,
+                songUrl: q.songs[0] ? q.songs[0].url : null,
+                queueLength: q.songs.length > 0 ? q.songs.length - 1 : 0,
+                voiceChannel: q.voiceChannel ? q.voiceChannel.name : 'Unknown Channel',
+                isPaused: q.player ? q.player.state.status === AudioPlayerStatus.Paused : false,
+                nextSongs: q.songs.slice(1, 4).map(s => s ? s.title : 'Unknown') 
+            };
+        });
 
-    res.json({
-        botName: client.user ? client.user.tag : 'Bot desconectado',
-        botAvatar: client.user ? client.user.displayAvatarURL() : '',
-        ping: client.ws.ping,
-        totalGuilds: client.guilds.cache.size,
-        activeStreams: activeStreams
-    });
+        res.json({
+            botName: client.user ? client.user.tag : 'Bot iniciando...',
+            botAvatar: client.user ? client.user.displayAvatarURL() : '',
+            ping: client.ws ? client.ws.ping : 0,
+            totalGuilds: client.guilds.cache ? client.guilds.cache.size : 0,
+            activeStreams: activeStreams
+        });
+    } catch (err) {
+        console.error("Dashboard API Error:", err.stack);
+        res.status(500).json({ error: 'Internal Dashboard Error' });
+    }
 });
 
 app.post('/api/action/:guildId/:action', (req, res) => {
@@ -364,6 +408,16 @@ app.post('/api/action/:guildId/:action', (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+});
+
+app.get('/api/logs', (req, res) => {
+    res.json(globalLogs);
+});
+
+app.post('/api/shutdown', (req, res) => {
+    res.json({ message: 'El bot se está apagando...' });
+    console.log('Recibida señal de apagado desde el Dashboard.');
+    setTimeout(() => process.exit(0), 1000);
 });
 
 app.listen(3000, () => {

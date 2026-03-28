@@ -34,6 +34,11 @@
                         <span class="stat-value" id="botGuilds">--</span>
                     </div>
                 </div>
+                <!-- Action Buttons -->
+                <div class="system-actions">
+                    <button id="btnLogs" class="btn-sys primary" title="Ver Logs del Bot"><i class="fas fa-terminal"></i> Logs</button>
+                    <button id="btnShutdown" class="btn-sys danger" title="Apagar Bot Definitivamente"><i class="fas fa-power-off"></i></button>
+                </div>
             </div>
         </header>
 
@@ -85,6 +90,24 @@
             </div>
         </div>
     </template>
+
+    <!-- Logs Modal -->
+    <div id="logsModal" class="modal-overlay">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2><i class="fas fa-terminal"></i> Terminal / Logs</h2>
+                <button id="btnCloseLogs" class="btn-close"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <div class="terminal-window" id="logsContainer">
+                    <div class="log-line">Esperando logs...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-sys outline" onclick="fetchLogs()">Refrescar</button>
+            </div>
+        </div>
+    </div>
 
     <script src="script.js"></script>
 </body>
