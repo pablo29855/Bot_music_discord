@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Discord Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-animation"></div>
+    <div class="container">
+        <header>
+            <div class="bot-info">
+                <img id="botAvatar" src="https://cdn.pixabay.com/photo/2020/07/01/12/58/icon-5359553_1280.png" alt="Bot Avatar" class="avatar">
+                <div>
+                    <h1 id="botName">Cargando...</h1>
+                    <span class="status-badge"><i class="fas fa-circle status-icon"></i> Online</span>
+                </div>
+            </div>
+            <div class="stats">
+                <div class="stat-card">
+                    <i class="fas fa-network-wired"></i>
+                    <div class="stat-info">
+                        <span class="stat-label">Ping</span>
+                        <span class="stat-value" id="botPing">-- ms</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-server"></i>
+                    <div class="stat-info">
+                        <span class="stat-label">Servidores</span>
+                        <span class="stat-value" id="botGuilds">--</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main id="streamsContainer">
+            <div class="loading-state">
+                <i class="fas fa-circle-notch fa-spin"></i>
+                <p>Buscando transmisiones activas...</p>
+            </div>
+        </main>
+    </div>
+
+    <!-- Template for Streams -->
+    <template id="streamTemplate">
+        <div class="stream-card">
+            <div class="card-header">
+                <h2><i class="fas fa-music"></i> <span class="guild-name">Server Name</span></h2>
+                <div class="channel-badge"><i class="fas fa-volume-up"></i> <span class="channel-name">Voice Channel</span></div>
+            </div>
+            <div class="card-body">
+                <div class="current-track">
+                    <div class="track-icon">
+                        <i class="fab fa-youtube"></i>
+                    </div>
+                    <div class="track-details">
+                        <p class="now-playing-label">Reproduciendo ahora</p>
+                        <div class="track-title-wrapper">
+                            <h3 class="track-title">Song Title</h3>
+                        </div>
+                        <a href="#" class="track-url" target="_blank"><i class="fas fa-external-link-alt"></i> Abrir Link</a>
+                    </div>
+                    <div class="audio-quality">
+                        <span class="quality-badge"><i class="fas fa-headphones"></i> Studio Quality</span>
+                        <span class="bitrate-badge">192kbps / Buffered</span>
+                    </div>
+                </div>
+                
+                <div class="player-controls" data-guild="">
+                    <button class="btn-control action-pause" title="Pausar / Reanudar"><i class="fas fa-pause"></i></button>
+                    <button class="btn-control action-skip" title="Saltar Canción"><i class="fas fa-step-forward"></i></button>
+                    <button class="btn-control action-stop" title="Detener Bot"><i class="fas fa-stop"></i></button>
+                </div>
+
+                <div class="queue-section">
+                    <h4>Cola (<span class="queue-length">0</span> en espera)</h4>
+                    <ul class="upcoming-tracks">
+                        <!-- li tracks here -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <script src="script.js"></script>
+</body>
+</html>
