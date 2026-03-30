@@ -91,6 +91,7 @@ function updateDashboard(data) {
 
         // Configurar botones de control
         const pauseBtn = clone.querySelector('.action-pause');
+        const shuffleBtn = clone.querySelector('.action-shuffle');
         const skipBtn = clone.querySelector('.action-skip');
         const stopBtn = clone.querySelector('.action-stop');
 
@@ -105,6 +106,7 @@ function updateDashboard(data) {
             pauseBtn.onclick = () => sendAction(stream.guildId, 'pause');
         }
 
+        shuffleBtn.onclick = () => sendAction(stream.guildId, 'shuffle');
         skipBtn.onclick = () => sendAction(stream.guildId, 'skip');
         stopBtn.onclick = () => sendAction(stream.guildId, 'stop');
 

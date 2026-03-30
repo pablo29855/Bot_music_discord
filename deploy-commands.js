@@ -23,6 +23,10 @@ const commands = [
         description: 'Detiene la música y desconecta el bot'
     },
     {
+        name: 'shuffle',
+        description: 'Mezcla las canciones de la cola'
+    },
+    {
         name: 'queue',
         description: 'Muestra la lista de canciones en la cola'
     }

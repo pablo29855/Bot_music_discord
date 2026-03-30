@@ -350,6 +350,27 @@ client.on('interactionCreate', async interaction => {
         queue.delete(guild.id);
         interaction.reply('⏹ Detenido.');
     }
+
+    if (commandName === 'shuffle') {
+        if (!serverQueue || serverQueue.songs.length <= 2)
+            return interaction.reply({ content: 'No hay suficientes canciones en la cola para mezclar.', ephemeral: true });
+
+        const currentSong = serverQueue.songs.shift();
+        for (let i = serverQueue.songs.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [serverQueue.songs[i], serverQueue.songs[j]] = [serverQueue.songs[j], serverQueue.songs[i]];
+        }
+        serverQueue.songs.unshift(currentSong);
+        interaction.reply('🔀 Cola mezclada.');
+    }
+
+    if (commandName === 'queue') {
+        if (!serverQueue || !serverQueue.songs.length)
+            return interaction.reply('La cola está vacía.');
+
+        const list = serverQueue.songs.slice(0, 10).map((s, i) => `${i === 0 ? '▶' : `${i}.`} **${s.title}**`).join('\n');
+        interaction.reply(`📜 **Cola de reproducción:**\n${list}${serverQueue.songs.length > 10 ? `\n... y ${serverQueue.songs.length - 10} más.` : ''}`);
+    }
 });
 
 // --- API DASHBOARD ---
@@ -399,7 +420,19 @@ app.post('/api/action/:guildId/:action', (req, res) => {
         } else if (action === 'resume') {
             q.player.unpause();
         } else if (action === 'skip') {
-            q.player.stop(); // Stop triggers idle, which plays next sonq
+            q.player.stop(); // Stop triggers idle, which plays next song
+        } else if (action === 'shuffle') {
+            if (q.songs.length > 2) {
+                // Shuffle everything after the current song
+                const currentSong = q.songs.shift();
+                // Fisher-Yates Shuffle
+                for (let i = q.songs.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [q.songs[i], q.songs[j]] = [q.songs[j], q.songs[i]];
+                }
+                q.songs.unshift(currentSong);
+                console.log(`[INFO] [Shuffle] La cola en ${guildId} ha sido mezclada.`);
+            }
         } else if (action === 'stop') {
             q.connection.destroy();
             queue.delete(guildId);

@@ -306,6 +306,11 @@ main {
     box-shadow: 0 0 15px rgba(237, 66, 69, 0.5);
 }
 
+.btn-control.action-shuffle:hover {
+    background: #1DB954;
+    box-shadow: 0 0 15px rgba(29, 185, 84, 0.5);
+}
+
 @media (max-width: 768px) {
     header { flex-direction: column; gap: 1.5rem; text-align: center; }
     .bot-info { flex-direction: column; }
