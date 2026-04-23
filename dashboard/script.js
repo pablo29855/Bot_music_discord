@@ -26,6 +26,43 @@ async function fetchStatus() {
     }
 }
 
+async function addSong(guildId, inputEl, wrapperEl) {
+    const query = inputEl.value.trim();
+    if (!query) return;
+
+    // UI Feedback: Loading
+    wrapperEl.classList.add('loading');
+    inputEl.disabled = true;
+    const btn = wrapperEl.querySelector('.btn-add-song');
+    btn.disabled = true;
+
+    try {
+        const response = await fetch(`http://localhost:3000/api/play/${guildId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query })
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            inputEl.value = '';
+            // Toast notify could be added here, but refreshing status is usually enough
+            fetchStatus(); 
+        } else {
+            alert(result.error || 'Error al agregar canción');
+        }
+    } catch (error) {
+        console.error('Error adding song:', error);
+        alert('Error de conexión al agregar canción');
+    } finally {
+        wrapperEl.classList.remove('loading');
+        inputEl.disabled = false;
+        btn.disabled = false;
+        inputEl.focus();
+    }
+}
+
 async function sendAction(guildId, action) {
     try {
         const response = await fetch(`${ACTION_URL}/${guildId}/${action}`, { method: 'POST' });
@@ -63,83 +100,123 @@ function updateDashboard(data) {
         return;
     }
 
-    container.innerHTML = ''; // Limpiar contenedor principal
+    // Limpiar mensaje de carga si existe
+    if (container.querySelector('.loading-state')) {
+        container.innerHTML = '';
+    }
+
     const template = document.getElementById('streamTemplate');
+    const existingCards = Array.from(container.querySelectorAll('.stream-card'));
+    const activeGuildIds = data.activeStreams.map(s => s.guildId);
+
+    // Eliminar tarjetas de servidores que ya no están activos
+    existingCards.forEach(card => {
+        if (!activeGuildIds.includes(card.dataset.guildId)) {
+            card.remove();
+        }
+    });
 
     data.activeStreams.forEach(stream => {
-        const clone = template.content.cloneNode(true);
+        let card = container.querySelector(`.stream-card[data-guild-id="${stream.guildId}"]`);
         
-        clone.querySelector('.guild-name').innerText = stream.guildName;
-        clone.querySelector('.channel-name').innerText = stream.voiceChannel;
-        
-        if (stream.currentSong) {
-            clone.querySelector('.track-title').innerText = stream.currentSong;
-            clone.querySelector('.track-title').title = stream.currentSong;
-            clone.querySelector('.track-url').href = stream.songUrl;
+        if (!card) {
+            // Crear nueva tarjeta si no existe
+            const clone = template.content.cloneNode(true);
+            const cardInner = clone.querySelector('.stream-card');
+            cardInner.dataset.guildId = stream.guildId;
+            container.appendChild(clone);
+            card = container.querySelector(`.stream-card[data-guild-id="${stream.guildId}"]`);
             
-            if(stream.songUrl && stream.songUrl.includes('spotify')) {
-                clone.querySelector('.track-icon i').className = 'fab fa-spotify';
-                clone.querySelector('.track-icon').style.background = '#1DB954';
-                clone.querySelector('.track-icon').style.boxShadow = '0 5px 15px rgba(29, 185, 84, 0.3)';
-            }
-        } else {
-            clone.querySelector('.track-title').innerText = 'Cargando stream...';
-            clone.querySelector('.track-url').style.display = 'none';
+            // Bindings iniciales para la nueva tarjeta
+            const pauseBtn = card.querySelector('.action-pause');
+            const shuffleBtn = card.querySelector('.action-shuffle');
+            const skipBtn = card.querySelector('.action-skip');
+            const stopBtn = card.querySelector('.action-stop');
+            const addBtn = card.querySelector('.btn-add-song');
+            const addInput = card.querySelector('.add-song-input');
+            const searchWrapper = card.querySelector('.search-input-wrapper');
+
+            shuffleBtn.onclick = () => sendAction(stream.guildId, 'shuffle');
+            skipBtn.onclick = () => sendAction(stream.guildId, 'skip');
+            stopBtn.onclick = () => sendAction(stream.guildId, 'stop');
+            addBtn.onclick = () => addSong(stream.guildId, addInput, searchWrapper);
+            addInput.onkeypress = (e) => { if (e.key === 'Enter') addSong(stream.guildId, addInput, searchWrapper); };
         }
 
-        clone.querySelector('.queue-length').innerText = stream.queueLength;
+        // Actualizar contenido de la tarjeta existente o recién creada
+        card.querySelector('.guild-name').innerText = stream.guildName;
+        card.querySelector('.channel-name').innerText = stream.voiceChannel;
+        
+        const nowPlayingLabel = card.querySelector('.now-playing-label');
+        const pauseBtn = card.querySelector('.action-pause');
 
-        // Configurar botones de control
-        const pauseBtn = clone.querySelector('.action-pause');
-        const shuffleBtn = clone.querySelector('.action-shuffle');
-        const skipBtn = clone.querySelector('.action-skip');
-        const stopBtn = clone.querySelector('.action-stop');
-
-        // Lógica de Pause/Resume
         if (stream.isPaused) {
             pauseBtn.innerHTML = '<i class="fas fa-play"></i>';
             pauseBtn.onclick = () => sendAction(stream.guildId, 'resume');
-            clone.querySelector('.now-playing-label').innerText = 'Pausado';
-            clone.querySelector('.now-playing-label').style.color = '#fee75c';
+            nowPlayingLabel.innerText = 'Pausado';
+            nowPlayingLabel.style.color = '#fee75c';
         } else {
             pauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
             pauseBtn.onclick = () => sendAction(stream.guildId, 'pause');
+            nowPlayingLabel.innerText = 'Reproduciendo ahora';
+            nowPlayingLabel.style.color = 'var(--text-muted)';
         }
 
-        shuffleBtn.onclick = () => sendAction(stream.guildId, 'shuffle');
-        skipBtn.onclick = () => sendAction(stream.guildId, 'skip');
-        stopBtn.onclick = () => sendAction(stream.guildId, 'stop');
-
-        const ul = clone.querySelector('.upcoming-tracks');
-        if (stream.nextSongs.length > 0) {
-            stream.nextSongs.forEach(song => {
-                const li = document.createElement('li');
-                li.innerText = song.length > 50 ? song.substring(0, 47) + '...' : song;
-                ul.appendChild(li);
-            });
-        } else {
-             const li = document.createElement('li');
-             li.innerText = 'No hay más canciones en la cola.';
-             li.style.color = 'var(--text-muted)';
-             li.style.background = 'transparent';
-             li.style.padding = '0';
-             li.style.setProperty('--bullet-display', 'none'); 
-             ul.appendChild(li);
-        }
-
-        container.appendChild(clone);
-
-        // Activar marquesina si el titulo es muy largo
-        const addedCard = container.lastElementChild;
-        if (addedCard) {
-            const titleWrapper = addedCard.querySelector('.track-title-wrapper');
-            const titleEl = addedCard.querySelector('.track-title');
+        if (stream.currentSong) {
+            const titleEl = card.querySelector('.track-title');
+            const titleWrapper = card.querySelector('.track-title-wrapper');
             
-            if (titleWrapper && titleEl && titleEl.scrollWidth > titleWrapper.clientWidth) {
-                // Calcular la diferencia para animar
-                const diff = titleEl.scrollWidth - titleWrapper.clientWidth + 50; 
-                titleEl.style.setProperty('--scroll-dist', `-${diff}px`);
-                titleEl.style.animation = `marquee 8s linear infinite alternate`;
+            // Solo actualizar si el título cambió para no reiniciar la marquesina
+            if (titleEl.innerText !== stream.currentSong) {
+                titleEl.innerText = stream.currentSong;
+                titleEl.title = stream.currentSong;
+                card.querySelector('.track-url').href = stream.songUrl;
+                card.querySelector('.track-url').style.display = 'block';
+
+                if(stream.songUrl && stream.songUrl.includes('spotify')) {
+                    card.querySelector('.track-icon i').className = 'fab fa-spotify';
+                    card.querySelector('.track-icon').style.background = '#1DB954';
+                    card.querySelector('.track-icon').style.boxShadow = '0 5px 15px rgba(29, 185, 84, 0.3)';
+                } else {
+                    card.querySelector('.track-icon i').className = 'fab fa-youtube';
+                    card.querySelector('.track-icon').style.background = '#FF0000';
+                    card.querySelector('.track-icon').style.boxShadow = '0 5px 15px rgba(255, 0, 0, 0.3)';
+                }
+
+                // Reiniciar marquesina si es necesario
+                titleEl.style.animation = 'none';
+                void titleEl.offsetWidth; // Force reflow
+                if (titleEl.scrollWidth > titleWrapper.clientWidth) {
+                    const diff = titleEl.scrollWidth - titleWrapper.clientWidth + 50; 
+                    titleEl.style.setProperty('--scroll-dist', `-${diff}px`);
+                    titleEl.style.animation = `marquee 8s linear infinite alternate`;
+                }
+            }
+        }
+
+        card.querySelector('.queue-length').innerText = stream.queueLength;
+
+        const ul = card.querySelector('.upcoming-tracks');
+        // Solo actualizar la cola si cambió (comparación simple de longitud o nombres)
+        const currentNextSongs = Array.from(ul.querySelectorAll('li')).map(li => li.innerText);
+        const newNextSongs = stream.nextSongs;
+
+        if (JSON.stringify(currentNextSongs) !== JSON.stringify(newNextSongs)) {
+            ul.innerHTML = '';
+            if (newNextSongs.length > 0) {
+                newNextSongs.forEach(song => {
+                    const li = document.createElement('li');
+                    li.innerText = song;
+                    ul.appendChild(li);
+                });
+            } else {
+                 const li = document.createElement('li');
+                 li.innerText = 'No hay más canciones en la cola.';
+                 li.style.color = 'var(--text-muted)';
+                 li.style.background = 'transparent';
+                 li.style.padding = '0';
+                 li.style.setProperty('--bullet-display', 'none'); 
+                 ul.appendChild(li);
             }
         }
     });

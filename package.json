@@ -38,7 +38,7 @@
     "spotify-web-api-node": "^5.0.2",
     "systeminformation": "^5.27.6",
     "tweetnacl": "^1.0.3",
-    "youtube-dl-exec": "^3.1.4",
+    "youtube-dl-exec": "^3.1.5",
     "yt-dlp-exec": "^1.0.2",
     "ytdl-core": "^4.11.5"
   }

@@ -13,6 +13,7 @@ const youtubedl = require('youtube-dl-exec');
 const { getTracks, getPreview } = require('spotify-url-info')(fetch);
 const NodeCache = require('node-cache');
 const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -33,8 +34,8 @@ function addLog(type, args) {
 const originalLog = console.log;
 const originalError = console.error;
 
-console.log = function(...args) { addLog('INFO', args); originalLog.apply(console, args); };
-console.error = function(...args) { addLog('ERROR', args); originalError.apply(console, args); };
+console.log = function (...args) { addLog('INFO', args); originalLog.apply(console, args); };
+console.error = function (...args) { addLog('ERROR', args); originalError.apply(console, args); };
 
 const client = new Client({
     intents: [
@@ -86,8 +87,12 @@ function createFFmpegStream(url) {
         'pipe:1'
     ];
 
-    const process = spawn('ffmpeg', args, {
-        stdio: ['ignore', 'pipe', 'ignore']
+    const process = spawn(ffmpegPath, args, {
+        stdio: ['ignore', 'pipe', 'pipe'] // Capture stderr for debugging if needed
+    });
+
+    process.stderr.on('data', (data) => {
+        // Optional: console.error(`FFMPEG: ${data}`);
     });
 
     return process;
@@ -146,12 +151,12 @@ async function getSpotifyTracks(url) {
         // Obtenemos los tracks mediante scraping web nativo gracias a spotify-url-info
         // (Esto saltea por completo el Error 403 Forbidden de las APIs Oficiales).
         const spTracks = await getTracks(url);
-        
+
         for (const t of spTracks) {
             if (!t) break;
             const titleStr = t.name ? t.name : '';
             const artistStr = (t.artists && t.artists[0]) ? t.artists[0].name : '';
-            
+
             tracks.push({
                 title: `${titleStr} - ${artistStr}`,
                 query: `${titleStr} ${artistStr}`,
@@ -163,7 +168,7 @@ async function getSpotifyTracks(url) {
         console.error("Scanner fallback failed:", e.message);
         throw e;
     }
-    
+
     return tracks;
 }
 
@@ -233,6 +238,103 @@ async function playSong(guildId, song) {
     }
 }
 
+/**
+ * Universal helper for adding songs from Slash Commands or API
+ */
+async function handleAddSong(guild, voiceChannel, query, interaction = null) {
+    let serverQueue = queue.get(guild.id);
+    let songsToAdd = [];
+
+    if (isYouTubeURL(query)) {
+        try {
+            const info = await youtubedl(query, { dumpSingleJson: true, noPlaylist: true, noWarnings: true });
+            songsToAdd.push({ title: info.title || query, url: query });
+        } catch {
+            songsToAdd.push({ title: 'Youtube Link', url: query });
+        }
+    } else if (isSpotifyURL(query)) {
+        try {
+            const tracks = await getSpotifyTracks(query);
+            for (const t of tracks) {
+                songsToAdd.push(t);
+            }
+        } catch (err) {
+            console.error("Error obteniendo Spotify:", err.message);
+            const msg = "❌ No pudimos acceder a este enlace de Spotify.";
+            if (interaction) await interaction.followUp(msg);
+            return { error: msg };
+        }
+    } else {
+        const song = await searchYouTube(query);
+        if (song) songsToAdd.push(song);
+    }
+
+    if (!songsToAdd.length) {
+        const msg = 'No se encontró resultado.';
+        if (interaction) await interaction.followUp(msg);
+        return { error: msg };
+    }
+
+    if (!serverQueue) {
+        if (!voiceChannel) {
+            const msg = 'Debes estar en un canal de voz.';
+            if (interaction) await interaction.followUp(msg);
+            return { error: msg };
+        }
+
+        const player = createAudioPlayer({
+            behaviors: {
+                noSubscriber: 'play',
+                maxMissedFrames: 5
+            }
+        });
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: guild.id,
+            adapterCreator: guild.voiceAdapterCreator
+        });
+
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+        } catch (error) {
+            connection.destroy();
+            const msg = "❌ No pude conectarme al canal de voz.";
+            if (interaction) await interaction.followUp(msg);
+            return { error: msg };
+        }
+
+        connection.subscribe(player);
+
+        const queueConstruct = {
+            textChannel: interaction ? interaction.channel : null,
+            voiceChannel,
+            connection,
+            songs: songsToAdd,
+            player,
+            currentFFmpeg: null
+        };
+
+        queue.set(guild.id, queueConstruct);
+        setupPlayer(guild.id, player);
+        await playSong(guild.id, songsToAdd[0]);
+
+        if (interaction) interaction.followUp(`🎶 Sonando: **${songsToAdd[0].title}**`);
+    } else {
+        for (const s of songsToAdd) {
+            serverQueue.songs.push(s);
+        }
+
+        if (serverQueue.player.state.status === AudioPlayerStatus.Idle) {
+            playSong(guild.id, serverQueue.songs[0]);
+        }
+
+        if (interaction) interaction.followUp(`➕ Añadido ${songsToAdd.length} canción(es) a la cola.`);
+    }
+
+    return { success: true, count: songsToAdd.length };
+}
+
 client.once('ready', async () => {
     await initSpotify();
     console.log(`✅ Bot conectado como ${client.user.tag}`);
@@ -255,83 +357,10 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply();
 
         const query = interaction.options.getString('cancion');
-        let songsToAdd = [];
+        const result = await handleAddSong(guild, voiceChannel, query, interaction);
+        if (result.error) return; // Error was already handled (interaction.reply/followUp)
 
-        if (isYouTubeURL(query)) {
-            try {
-                const info = await youtubedl(query, { dumpSingleJson: true, noPlaylist: true, noWarnings: true });
-                songsToAdd.push({ title: info.title || query, url: query });
-            } catch {
-                songsToAdd.push({ title: 'Youtube Link', url: query });
-            }
-        } else if (isSpotifyURL(query)) {
-            try {
-                const tracks = await getSpotifyTracks(query);
-                for (const t of tracks) {
-                    songsToAdd.push(t);
-                }
-            } catch (err) {
-                console.error("Error obteniendo Spotify (probablemente una lista Privada o Token vencido):", err.message);
-                return interaction.followUp("❌ No pudimos acceder a este enlace de Spotify. ¿Es posible que la Playlist sea privada?");
-            }
-        } else {
-            const song = await searchYouTube(query);
-            if (song) songsToAdd.push(song);
-        }
-
-        if (!songsToAdd.length)
-            return interaction.followUp('No se encontró resultado.');
-
-        if (!serverQueue) {
-            const player = createAudioPlayer({
-                behaviors: {
-                    noSubscriber: 'play',
-                    maxMissedFrames: 5
-                }
-            });
-
-            const connection = joinVoiceChannel({
-                channelId: voiceChannel.id,
-                guildId: guild.id,
-                adapterCreator: guild.voiceAdapterCreator
-            });
-
-            try {
-                await entersState(connection, VoiceConnectionStatus.Ready, 30000);
-            } catch (error) {
-                connection.destroy();
-                return interaction.followUp("❌ No pude conectarme al canal de voz.");
-            }
-
-            connection.subscribe(player);
-
-            const queueConstruct = {
-                textChannel: interaction.channel,
-                voiceChannel,
-                connection,
-                songs: songsToAdd,
-                player,
-                currentFFmpeg: null
-            };
-
-            queue.set(guild.id, queueConstruct);
-
-            setupPlayer(guild.id, player);
-
-            await playSong(guild.id, songsToAdd[0]);
-
-            interaction.followUp(`🎶 Sonando: **${songsToAdd[0].title}**`);
-        } else {
-            for (const s of songsToAdd) {
-                serverQueue.songs.push(s);
-            }
-
-            if (serverQueue.player.state.status === AudioPlayerStatus.Idle) {
-                playSong(guild.id, serverQueue.songs[0]);
-            }
-
-            interaction.followUp(`➕ Añadido ${songsToAdd.length} canción(es) a la cola. ${songsToAdd.length === 100 ? '(Nota: Spotify restringe nuevas apps a 100 max)' : ''}`);
-        }
+        // No success message needed here as handleAddSong handles it for interaction.
     }
 
     if (commandName === 'skip') {
@@ -391,7 +420,7 @@ app.get('/api/status', (req, res) => {
                 queueLength: q.songs.length > 0 ? q.songs.length - 1 : 0,
                 voiceChannel: q.voiceChannel ? q.voiceChannel.name : 'Unknown Channel',
                 isPaused: q.player ? q.player.state.status === AudioPlayerStatus.Paused : false,
-                nextSongs: q.songs.slice(1, 4).map(s => s ? s.title : 'Unknown') 
+                nextSongs: q.songs.slice(1, 4).map(s => s ? s.title : 'Unknown')
             };
         });
 
@@ -438,6 +467,32 @@ app.post('/api/action/:guildId/:action', (req, res) => {
             queue.delete(guildId);
         }
         res.json({ success: true, action });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/play/:guildId', express.json(), async (req, res) => {
+    const { guildId } = req.params;
+    const { query } = req.body;
+
+    if (!query) return res.status(400).json({ error: 'Query is required' });
+
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return res.status(404).json({ error: 'Guild not found' });
+
+    const q = queue.get(guildId);
+    let voiceChannel = q ? q.voiceChannel : null;
+
+    // From GUI, we only allow adding if already in a voice channel
+    if (!voiceChannel) {
+        return res.status(400).json({ error: 'Bot needs to be in a voice channel first' });
+    }
+
+    try {
+        const result = await handleAddSong(guild, voiceChannel, query);
+        if (result.error) return res.status(400).json({ error: result.error });
+        res.json({ success: true, message: `Añadido ${result.count} canción(es).` });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
